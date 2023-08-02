@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { OptionBase } from "chakra-react-select";
+import { Dictionary } from "lodash";
 
+export interface DHIS2Options {
+    programStage: string[];
+    prefetch: boolean;
+}
 export interface IMapping {
     id: string;
     name: string;
@@ -88,31 +93,13 @@ export interface Authentication {
 
 export interface IProgramMapping extends IMapping {
     program: string;
-    // id: string;
-    // name: string;
-    // displayName: string;
-    // lastUpdated: any;
     programType: string;
-
-    // programStages: IProgramStage[];
-    // categoryCombo: string;
-    // programTrackedEntityAttributes: any;
     trackedEntityType: string;
-    // trackedEntity: string;
-    // mappingId: string;
-    // isRunning: boolean;
     orgUnitColumn: string;
-    manuallyMapOrgUnitColumn: boolean;
-    manuallyMapEnrollmentDateColumn: boolean;
-    manuallyMapIncidentDateColumn: boolean;
+    customOrgUnitColumn: boolean;
+    customEnrollmentDateColumn: boolean;
+    customIncidentDateColumn: boolean;
     orgUnitsUploaded: boolean;
-    // orgUnitStrategy: {
-    //     value: "auto";
-    //     label: "auto";
-    // };
-    // organisationUnits: IOrganisationUnit[];
-    // headerRow: 1;
-    // dataStartRow: 2;
     createEnrollments: boolean;
     createEntities: boolean;
     updateEntities: boolean;
@@ -127,91 +114,27 @@ export interface IProgramMapping extends IMapping {
     trackedEntityInstanceColumnIsManual: boolean;
     remoteOrgUnitLabelField: string;
     remoteOrgUnitValueField: string;
+    onlyEnrollOnce: boolean;
     metadataOptions: {
         labelField: string;
         valueField: string;
-        metadata: any[];
+        metadata: Option[];
         sourceType: "api" | "upload";
         idField: string;
         requiredField: string;
         dhis2: string;
         mapper: string;
     };
-
-    // dateFilter: string;
-    // dateEndFilter: string;
-    // lastRun: string;
-    // uploaded: string;
-    // uploadMessage: string;
-    // page: number;
-    // rowsPerPage: number;
-    // dialogOpen: false;
-    // orderBy: "mandatory";
-    // order: "desc";
-    // attributesFilter: string;
-
-    // trackedEntityInstances: [];
-    // fetchingEntities: 0;
-
-    // responses: any[];
-
-    // increment: 0;
-
-    // errors: any[];
-    // conflicts: any[];
-    // duplicates: any[];
-
-    // longitudeColumn: string;
-    // latitudeColumn: string;
-
-    // pulling: boolean;
-
-    // workbook: null;
-
-    // selectedSheet: null;
-
-    // pulledData: null;
-
-    // sheets: any[];
-
+    dhis2Options: Partial<DHIS2Options>;
+    withoutRegistration: boolean;
     dataSource: "xlsx" | "dhis2" | "api" | "csv" | "json" | "godata";
-
-    // scheduleTime: 0;
-
-    // percentages: any[];
-
-    // total: number;
-    // displayProgress: boolean;
-
-    // username: string;
-    // password: string;
-    // params: any[];
     responseKey: string;
-    // fileName: string;
-    // mappingName: string;
-    // mappingDescription: string;
-    // templateType: string;
-    // sourceOrganisationUnits: [];
-    // message: string;
-    // incidentDateProvided: boolean;
-    // processed: boolean;
-    // data: [];
-    // isUploadingFromPage: boolean;
-
-    // selectIncidentDatesInFuture: string;
-    // selectEnrollmentDatesInFuture: string;
-    isDHIS2: boolean;
-    // attributes: boolean;
-    // remotePrograms: [];
     remoteProgram: string;
-    // remoteId: string;
     orgUnitSource: "api" | "manual" | "default";
-    // enrollments: boolean;
-    // events: boolean;
-    // remoteStage: string;
-    // remoteTrackedEntityTypes: {};
     created: string;
     lastUpdated: string;
+    selectIncidentDatesInFuture: boolean;
+    selectEnrollmentDatesInFuture: boolean;
 }
 
 export interface IProgramStage {
@@ -275,8 +198,8 @@ export interface OptionSet {
 
 export interface IDataElement extends CommonIdentifier {
     displayName: string;
-    optionSet: boolean;
-    optionSetValue: string;
+    optionSet: OptionSet;
+    optionSetValue: boolean;
     valueType: keyof typeof ValueType;
     zeroIsSignificant: boolean;
 }
@@ -311,7 +234,7 @@ export interface IProgram {
 
 export interface RealMapping {
     manual: boolean;
-    compulsory: boolean;
+    mandatory: boolean;
     value: string;
     eventDateColumn: string;
     unique: boolean;
@@ -321,61 +244,12 @@ export interface RealMapping {
     eventIdColumn: string;
     stage: string;
     eventIdColumnIsManual: boolean;
+    specific: boolean;
+    valueType: string;
 }
 
 export interface Mapping {
     [key: string]: Partial<RealMapping>;
-}
-export interface TrackedEntityInstance {
-    created: string;
-    orgUnit: string;
-    createdAtClient: string;
-    trackedEntityInstance: string;
-    lastUpdated: string;
-    trackedEntityType: string;
-    potentialDuplicate: boolean;
-    deleted: boolean;
-    inactive: boolean;
-    featureType: string;
-    programOwners: ProgramOwner[];
-    enrollments: Array<Partial<Enrollment>>;
-    relationships: any[];
-    attributes: Array<Partial<Attribute>>;
-    lastUpdatedAtClient: string;
-}
-
-export interface Enrollment {
-    createdAtClient: string;
-    program: string;
-    lastUpdated: string;
-    created: string;
-    orgUnit: string;
-    enrollment: string;
-    trackedEntityInstance: string;
-    trackedEntityType: string;
-    orgUnitName: string;
-    enrollmentDate: string;
-    followup: boolean;
-    deleted: boolean;
-    incidentDate: string;
-    status: string;
-    notes: any[];
-    relationships: any[];
-    events: Event[];
-    attributes: Attribute[];
-    storedBy: string;
-    lastUpdatedAtClient: string;
-}
-
-export interface Attribute {
-    lastUpdated: string;
-    displayName: string;
-    created: string;
-    valueType: keyof typeof ValueType;
-    attribute: string;
-    value: string;
-    code?: string;
-    storedBy: string;
 }
 
 export interface Event {
@@ -403,6 +277,57 @@ export interface Event {
     storedBy: string;
 }
 
+export interface Attribute {
+    lastUpdated: string;
+    displayName: string;
+    created: string;
+    valueType: keyof typeof ValueType;
+    attribute: string;
+    value: string;
+    code?: string;
+    storedBy: string;
+}
+
+export interface Enrollment {
+    createdAtClient: string;
+    program: string;
+    lastUpdated: string;
+    created: string;
+    orgUnit: string;
+    enrollment: string;
+    trackedEntityInstance: string;
+    trackedEntityType: string;
+    orgUnitName: string;
+    enrollmentDate: string;
+    followup: boolean;
+    deleted: boolean;
+    incidentDate: string;
+    status: string;
+    notes: any[];
+    relationships: any[];
+    events: Array<Partial<Event>>;
+    attributes: Array<Partial<Attribute>>;
+    storedBy: string;
+    lastUpdatedAtClient: string;
+}
+export interface TrackedEntityInstance {
+    created: string;
+    orgUnit: string;
+    createdAtClient: string;
+    trackedEntityInstance: string;
+    lastUpdated: string;
+    trackedEntityType: string;
+    potentialDuplicate: boolean;
+    deleted: boolean;
+    inactive: boolean;
+    featureType: string;
+    programOwners: ProgramOwner[];
+    enrollments: Array<Partial<Enrollment>>;
+    relationships: any[];
+    attributes: Array<Partial<Attribute>>;
+    lastUpdatedAtClient: string;
+}
+
 export interface DataValue {
     lastUpdated: string;
     created: string;
@@ -425,7 +350,15 @@ export interface Option extends OptionBase {
     unique?: boolean;
     optionSetValue?: boolean;
     mandatory?: boolean;
-    options?: CommonIdentifier[];
+    availableOptions?: Option[];
+    valueType?: string;
+    entity?: string;
+    multiple?: boolean;
+}
+
+export interface MultiOption extends OptionBase {
+    options: Option[];
+    label: string;
 }
 
 export interface IGoData {
@@ -469,6 +402,11 @@ export interface IGoData {
     createdOn: string;
     deleted: boolean;
     locations: any[];
+    intervalOfFollowUp: string;
+    eventIdMask: string;
+    checkLastContactDateAgainstDateOnSet: boolean;
+    disableModifyingLegacyQuestionnaire: boolean;
+    dbUpdatedAt: string;
 }
 
 interface ArcGisServer {
@@ -479,7 +417,7 @@ interface ArcGisServer {
     styleUrlSource: string;
 }
 
-interface CaseInvestigationTemplate {
+export interface CaseInvestigationTemplate {
     multiAnswer: boolean;
     inactive: boolean;
     text: string;
@@ -637,7 +575,7 @@ export interface GODataOption {
 export interface ISchedule {
     id: string;
     name: string;
-    type: string;
+    type: "aggregate" | "tracker";
     schedule: string;
     createdAt: string;
     nextRun: string;
@@ -646,8 +584,90 @@ export interface ISchedule {
     schedulingSeverURL: string;
     description: string;
     immediate: boolean;
-    upstream: string;
     mapping: string;
     updatedAt: string;
     status: "scheduled" | "running" | "stopped" | "created";
+    url: string;
+}
+
+export interface FlattenedEvent {
+    [key: string]: Partial<
+        Omit<Event, "dataValues"> & { values: { [key: string]: string } }
+    >;
+}
+
+export type FlattenedEnrollment = Omit<Enrollment, "events">;
+
+export type FlattenedInstance = Omit<
+    TrackedEntityInstance,
+    "attributes" | "events" | "enrollments"
+> & {
+    attribute: Dictionary<string>;
+    first: FlattenedEvent;
+    last: FlattenedEvent;
+    events: Array<FlattenedEvent>;
+    enrollment: Partial<FlattenedEnrollment>;
+};
+
+export interface IGoDataData {
+    firstName: string;
+    wasContact: boolean;
+    outcomeId: string;
+    safeBurial: boolean;
+    classification: string;
+    dateInvestigationCompleted: string;
+    transferRefused: boolean;
+    questionnaireAnswers: QuestionnaireAnswers;
+    vaccinesReceived: any[];
+    id: string;
+    outbreakId: string;
+    visualId: string;
+    dob?: any;
+    age: Age;
+    occupation: string;
+    documents: any[];
+    addresses: Address[];
+    dateOfReporting: string;
+    isDateOfReportingApproximate: boolean;
+    dateOfOnset: string;
+    dateRanges: any[];
+    classificationHistory: ClassificationHistory[];
+    dateOfOutcome: string;
+    hasRelationships: boolean;
+    numberOfExposures: number;
+    numberOfContacts: number;
+    usualPlaceOfResidenceLocationId: string;
+    // duplicateKeys: Fever;
+    createdAt: string;
+    createdBy: string;
+    updatedAt: string;
+    updatedBy: string;
+    createdOn: string;
+    deleted: boolean;
+    // address: Fever;
+}
+
+interface ClassificationHistory {
+    classification: string;
+    startDate: string;
+    endDate?: string;
+}
+
+interface Address {
+    typeId: string;
+    locationId: string;
+    geoLocationAccurate: boolean;
+    date: string;
+}
+
+interface Age {
+    years: number;
+}
+
+interface QuestionnaireAnswers {
+    [key: string]: Array<Partial<GoValue>>;
+}
+
+interface GoValue {
+    value: string | number | boolean;
 }
