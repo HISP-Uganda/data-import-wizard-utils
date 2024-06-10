@@ -1,6 +1,5 @@
 import axios, { AxiosInstance } from "axios";
-import { parseISO } from "date-fns";
-import { format } from "date-fns/fp";
+import dayjs from "dayjs";
 import { diff } from "jiff";
 import {
     Dictionary,
@@ -45,7 +44,6 @@ import {
     Update,
     ValueType,
 } from "./interfaces";
-import { generateUid } from "./uid";
 import {
     convertToDHIS2,
     fetchTrackedEntityInstances,
@@ -53,6 +51,7 @@ import {
     flattenTrackedEntityInstances,
     processPreviousInstances,
 } from "./program";
+import { generateUid } from "./uid";
 
 export function modifyGoDataOu(
     node: GoDataOuTree,
@@ -603,7 +602,7 @@ export const evaluateMapping = (
             if (mapping) {
                 const validation = ValueType[mapping.valueType];
                 let value = getOr("", mapping.value, instanceData);
-                if (mapping.specific) {
+                if (mapping.isSpecific) {
                     value = mapping.value;
                 } else if (value && valueType === "INTEGER") {
                     value = parseInt(value, 10);
@@ -1106,7 +1105,6 @@ export const processElements = ({
     const processed = data.flatMap((d) => {
         return Object.entries(dataMapping).map(([key, { value }]) => {
             const [dataElement, categoryOptionCombo] = key.split(",");
-
             let result: AggDataValue = {
                 dataElement,
                 categoryOptionCombo,
@@ -1247,9 +1245,13 @@ export const createOptions2 = (
     });
 };
 
+export type DisabledPeriod = 0 | 1 | 2;
+
 export type PickerProps = {
     selectedPeriods: Period[];
     onChange: (periods: Period[], remove: boolean) => void;
+    disabled?: DisabledPeriod[];
+    active?: DisabledPeriod;
 };
 
 export const processDataSet = ({
@@ -1353,8 +1355,18 @@ export const validateValue = ({
     if (mapping.value) {
         const validation = ValueType[option.valueType];
         let value = getOr("", mapping.value, data);
-        if (mapping.specific) {
+        if (mapping.isSpecific) {
             value = mapping.value;
+        }
+        if (mapping.isCustom) {
+            if (mapping.customType === "join columns") {
+                value = mapping.value
+                    .split(",")
+                    .map((col) => getOr("", col, data))
+                    .join(" ");
+            } else if (mapping.customType === "extract year") {
+                value = dayjs(value, "YYYY-MM-DD").format("YYYY");
+            }
         }
         if (option.optionSetValue) {
             value = flippedOptions[value] || value;
@@ -1575,7 +1587,7 @@ export const makeEvent = ({
         [key: string]: Partial<RealMapping>;
     };
     programStage: string;
-    enrollment: string;
+    enrollment: { enrollmentDate: string; enrollment: string };
     trackedEntityInstance: string;
     program: string;
     orgUnit: string;
@@ -1587,91 +1599,55 @@ export const makeEvent = ({
     conflicts: any[];
     event: PartialEvent;
 }> => {
-    const possibleEventDate = getOr("", eventDateColumn, data);
+    const possibleEventDate = dayjs(getOr("", eventDateColumn, data));
     let dataValues = {};
     let conflicts: any[] = [];
     let errors: any[] = [];
-
-    if (possibleEventDate) {
-        try {
-            const actualDate = parseISO(possibleEventDate);
-            const eventDate = format("yyyy-MM-dd", actualDate);
-            if (eventDate) {
-                let eventGeometry = getGeometry({
-                    data,
-                    featureType,
-                    geometryColumn,
-                    geometryMerged,
-                    latitudeColumn,
-                    longitudeColumn,
-                });
-                const eventId = getOr(generateUid(), eventIdColumn, data);
-
-                Object.entries(elements).forEach(([dataElement, eMapping]) => {
-                    const currentDataElement = dataElements[dataElement];
-                    const validation = validateValue({
-                        data,
-                        option: currentDataElement,
-                        field: dataElement,
-                        mapping: eMapping,
-                        flippedOptions: options,
-                        uniqueKey,
-                    });
-                    if (validation.value) {
-                        dataValues = {
-                            ...dataValues,
-                            [dataElement]: validation.value,
-                        };
-                    } else {
-                        conflicts = conflicts.concat(validation.conflicts);
-                        errors = errors.concat(validation.errors);
-                    }
-                });
-
-                let event: PartialEvent = {
-                    eventDate,
-                    programStage,
-                    enrollment,
-                    trackedEntityInstance,
-                    program,
-                    orgUnit,
-                    event: eventId,
-                    dataValues,
+    if (possibleEventDate.isValid()) {
+        const eventDate = possibleEventDate.format("YYYY-MM-DD");
+        let eventGeometry = getGeometry({
+            data,
+            featureType,
+            geometryColumn,
+            geometryMerged,
+            latitudeColumn,
+            longitudeColumn,
+        });
+        const eventId = getOr(generateUid(), eventIdColumn, data);
+        Object.entries(elements).forEach(([dataElement, eMapping]) => {
+            const currentDataElement = dataElements[dataElement];
+            const validation = validateValue({
+                data,
+                option: currentDataElement,
+                field: dataElement,
+                mapping: eMapping,
+                flippedOptions: options,
+                uniqueKey,
+            });
+            if (validation.value) {
+                dataValues = {
+                    ...dataValues,
+                    [dataElement]: validation.value,
                 };
-
-                if (!isEmpty(eventGeometry)) {
-                    event = { ...event, geometry: eventGeometry };
-                }
-                return { event, errors, conflicts };
+            } else {
+                conflicts = conflicts.concat(validation.conflicts);
+                errors = errors.concat(validation.errors);
             }
-            return {
-                errors: [
-                    {
-                        id: Date.now() + Math.random(),
-                        uniqueKey,
-                        value: "",
-                        field: "eventDate",
-                        valueType: "DATE",
-                        message: `Event Date is missing or invalid`,
-                    },
-                ],
-                conflicts: [],
-            };
-        } catch (error) {
-            return {
-                errors: [
-                    {
-                        id: Date.now() + Math.random(),
-                        value: possibleEventDate,
-                        field: "eventDate",
-                        valueType: "DATE",
-                        message: `Event Date is invalid`,
-                        uniqueKey,
-                    },
-                ],
-                conflicts: [],
-            };
+        });
+        let event: PartialEvent = {
+            eventDate,
+            programStage,
+            enrollment: enrollment.enrollment,
+            trackedEntityInstance,
+            program,
+            orgUnit,
+            event: eventId,
+            dataValues,
+        };
+        if (!isEmpty(eventGeometry)) {
+            event = { ...event, geometry: eventGeometry };
         }
+        return { event, errors, conflicts };
     }
     return {
         errors: [
@@ -1720,7 +1696,7 @@ export const getConflicts = (error: DHIS2Response) => {
 export const processInstances = async (
     {
         trackedEntityInstances,
-        programMapping,
+        mapping,
         attributeMapping,
         api,
         version,
@@ -1733,7 +1709,7 @@ export const processInstances = async (
         setMessage,
     }: {
         attributeMapping: Mapping;
-        programMapping: Partial<IMapping>;
+        mapping: Partial<IMapping>;
         trackedEntityInstances: Array<Partial<TrackedEntityInstance>>;
         api: Partial<{ engine: any; axios: AxiosInstance }>;
         version: number;
@@ -1755,7 +1731,7 @@ export const processInstances = async (
     );
     let uniqueAttributeValues: any[] = [];
     let trackedInstanceIds: string[] = [];
-    if (programMapping.program?.trackedEntityInstanceColumn) {
+    if (mapping.program?.trackedEntityInstanceColumn) {
         trackedInstanceIds = trackedEntityInstances
             .map(({ trackedEntityInstance }) => trackedEntityInstance ?? "")
             .filter((a) => a !== "");
@@ -1770,7 +1746,7 @@ export const processInstances = async (
         setMessage(`Fetching data from destination program`);
         const instances = await fetchTrackedEntityInstances({
             api,
-            program: programMapping.program?.program,
+            program: mapping.program?.program,
             additionalParams: {},
             uniqueAttributeValues,
             withAttributes: true,
@@ -1783,15 +1759,15 @@ export const processInstances = async (
             trackedEntityInstances: instances.trackedEntityInstances,
             programUniqAttributes,
             programStageUniqueElements,
-            currentProgram: programMapping.program?.program,
-            eventIdIdentifiesEvent: trackedInstanceIds.length > 0,
+            currentProgram: mapping.program?.program,
             trackedEntityIdIdentifiesInstance: trackedInstanceIds.length > 0,
+            programStageMapping,
         });
 
         const convertedData = await convertToDHIS2({
             previousData: previous,
             data: currentData,
-            mapping: programMapping,
+            mapping: mapping,
             organisationUnitMapping,
             attributeMapping,
             programStageMapping,
