@@ -1,3 +1,5 @@
+import { AxiosInstance } from "axios";
+import { Style as ExcelStyle, IconSetTypes } from "exceljs";
 import { OptionBase } from "chakra-react-select";
 import { Dictionary } from "lodash";
 import type {
@@ -6,6 +8,7 @@ import type {
     ZodLiteral,
     ZodNumber,
     ZodString,
+    ZodUnion,
 } from "zod";
 import z from "zod";
 export type Extraction = "json" | "cell" | "column";
@@ -21,7 +24,8 @@ export type DataSource =
     | "dhis2-indicators"
     | "dhis2-program-indicators"
     | "dhis2-program"
-    | "manual-dhis2-program-indicators";
+    | "manual-dhis2-program-indicators"
+    | "fhir";
 export type ImportType =
     | "individual"
     | "aggregate"
@@ -46,88 +50,208 @@ export interface DHIS2DestinationOptions {
     chunkSize: number;
     async: boolean;
     completeDataSet: boolean;
+    skipRuleEngine: boolean;
+    skipSideEffects: boolean;
+    skipPatternValidation: boolean;
+}
+
+export type Filter = {
+    attribute: string;
+    operator: string;
+    value: string;
+};
+
+export interface ExportColumn {
+    column: string;
+    label: string;
+    repeatable?: boolean;
+    children: Array<Omit<ExportColumn, "children">>;
 }
 
 export interface DHIS2SourceOptions {
-    programStage: string[];
+    programStages: string[];
     ous: string[];
     period: Period[];
     useAnalytics: boolean;
     searchPeriod: "enrollmentDate" | "eventDate";
+    trackedEntityInstance: string;
+    attributeFilters: Filter[];
+    dataElementFilters: Filter[];
+    columns: ExportColumn[];
+    fetchBy: "program" | "trackedEntityType";
+    flattenBy: "trackedEntities" | "events" | "enrollments";
+    chunkSize: number;
 }
 
-export type Update = {
-    attribute: string;
-    key: keyof RealMapping;
-    value: any;
-};
-export type StageUpdate = Update & { stage: string };
-export type StageMapping = {
-    [key: string]: Mapping;
-};
-
-export type Processed = {
+export interface DHIS2ProcessedData {
     trackedEntityInstances: Array<Partial<TrackedEntityInstance>>;
     enrollments: Array<Partial<Enrollment>>;
+    enrollmentUpdates: Array<Partial<Enrollment>>;
     events: Array<Partial<Event>>;
     trackedEntityInstanceUpdates: Array<Partial<TrackedEntityInstance>>;
     eventUpdates: Array<Partial<Event>>;
     errors: Array<any>;
     conflicts: Array<any>;
+}
+
+export type Update = {
+    attribute: string;
+    key: keyof Option;
+    value: any;
+};
+export type StageUpdate = Update & { stage: string };
+export type StageMapping = Map<string, Mapping>;
+
+export type Processed = {
+    dhis2: DHIS2ProcessedData;
+    goData: {
+        inserts: GoResponse;
+        updates: GoResponse;
+        errors: GoResponse;
+        conflicts: GoResponse;
+    };
+    processedData: Array<any>;
 };
 export interface CommonIdentifier {
     id: string;
     name: string;
     code: string;
 }
+
 export interface TrackedEntityType extends CommonIdentifier {
+    trackedEntityTypeAttributes: IProgramTrackedEntityAttribute[];
     featureType: string;
+    id: string;
 }
 
 export interface DHIS2OrgUnit extends CommonIdentifier {
     parent: Partial<DHIS2OrgUnit>;
 }
+export type ValueTypeKey =
+    | "TEXT"
+    | "LONG_TEXT"
+    | "LETTER"
+    | "PHONE_NUMBER"
+    | "EMAIL"
+    | "BOOLEAN"
+    | "TRUE_ONLY"
+    | "DATE"
+    | "DATETIME"
+    | "TIME"
+    | "NUMBER"
+    | "UNIT_INTERVAL"
+    | "PERCENTAGE"
+    | "INTEGER"
+    | "INTEGER_POSITIVE"
+    | "INTEGER_NEGATIVE"
+    | "INTEGER_ZERO_OR_POSITIVE"
+    | "TRACKER_ASSOCIATE"
+    | "USERNAME"
+    | "COORDINATE"
+    | "ORGANISATION_UNIT"
+    | "REFERENCE"
+    | "AGE"
+    | "URL"
+    | "FILE_RESOURCE"
+    | "IMAGE"
+    | "GEOJSON"
+    | "MULTI_TEXT";
 
-export const ValueType: {
-    [key: string]:
-        | ZodString
-        | ZodBoolean
-        | ZodNumber
-        | ZodLiteral<true>
-        | ZodEffects<ZodNumber, number, unknown>;
-} = {
-    TEXT: z.string(),
-    LONG_TEXT: z.string(),
+export const ValueType: Record<
+    ValueTypeKey,
+    | ZodString
+    | ZodBoolean
+    | ZodNumber
+    | ZodLiteral<true>
+    | ZodEffects<ZodNumber, number, unknown>
+    | ZodUnion<[ZodNumber, ZodString]>
+    | ZodUnion<[ZodBoolean, ZodEffects<ZodString, boolean, string>]>
+    | ZodUnion<[ZodLiteral<true>, ZodEffects<ZodString, boolean, string>]>
+    | ZodUnion<[ZodString, ZodNumber]>
+> = {
+    TEXT: z.string().min(1),
+    LONG_TEXT: z.string().min(1),
     LETTER: z.string().length(1),
-    PHONE_NUMBER: z.string(),
+    PHONE_NUMBER: z.string().min(1),
     EMAIL: z.string().email(),
-    BOOLEAN: z.boolean(),
-    TRUE_ONLY: z.literal(true),
+    BOOLEAN: z.union([
+        z.boolean(),
+        z.string().transform((val, ctx) => {
+            const lowercased = val.toLowerCase().trim();
+            if (
+                lowercased === "true" ||
+                lowercased === "1" ||
+                lowercased === "yes"
+            )
+                return true;
+            if (
+                lowercased === "false" ||
+                lowercased === "0" ||
+                lowercased === "no"
+            )
+                return false;
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `Invalid boolean string: ${val}`,
+            });
+            return z.NEVER;
+        }),
+    ]),
+    TRUE_ONLY: z.union([
+        z.literal(true),
+        z.string().transform((val, ctx) => {
+            const lowercased = val.toLowerCase().trim();
+            if (
+                lowercased === "true" ||
+                lowercased === "1" ||
+                lowercased === "yes"
+            )
+                return true;
+
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `Invalid true only string: ${val}`,
+            });
+            return z.NEVER;
+        }),
+    ]),
     DATE: z.string().regex(/^(\d{4})-(\d{2})-(\d{2})/),
     DATETIME: z
         .string()
         .regex(
-            /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2}(?:\.\d*)?)((-(\d{2}):(\d{2})|Z)?)$/
+            /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2}(?:\.\d*)?)((-(\d{2}):(\d{2})|Z)?)$/,
         ),
     TIME: z.string().regex(/^(\d{2}):(\d{2})/),
     NUMBER: z.preprocess(Number, z.number()),
     UNIT_INTERVAL: z.string(),
-    PERCENTAGE: z.preprocess(Number, z.number().int().gte(0).lte(100)),
-    INTEGER: z.preprocess(Number, z.number().int()),
-    INTEGER_POSITIVE: z.preprocess(Number, z.number().int().positive().min(1)),
-    INTEGER_NEGATIVE: z.preprocess(Number, z.number().int().negative()),
-    INTEGER_ZERO_OR_POSITIVE: z.preprocess(Number, z.number().int().min(0)),
+    PERCENTAGE: z.union([
+        z.string().regex(/^\d+$/),
+        z.number().int().positive().lte(100),
+    ]),
+    INTEGER: z.union([z.string().regex(/^\d+$/), z.number().int()]),
+    INTEGER_POSITIVE: z.union([
+        z.string().regex(/^\d+$/),
+        z.number().int().positive(),
+    ]),
+    INTEGER_NEGATIVE: z.union([
+        z.string().regex(/^\d+$/),
+        z.number().int().negative(),
+    ]),
+    INTEGER_ZERO_OR_POSITIVE: z.union([
+        z.string().regex(/^\d+$/),
+        z.number().int().min(0),
+    ]),
     TRACKER_ASSOCIATE: z.string().length(11),
-    USERNAME: z.string(),
-    COORDINATE: z.string(),
+    USERNAME: z.string().min(1),
+    COORDINATE: z.string().min(1),
     ORGANISATION_UNIT: z.string().length(11),
     REFERENCE: z.string().length(11),
     AGE: z.string().regex(/^(\d{4})-(\d{2})-(\d{2})/),
     URL: z.string().url(),
     FILE_RESOURCE: z.string(),
-    IMAGE: z.string(),
-    GEOJSON: z.string(),
-    MULTI_TEXT: z.string(),
+    IMAGE: z.string().min(1),
+    GEOJSON: z.string().min(1),
+    MULTI_TEXT: z.string().min(1),
 };
 export interface Param {
     param: string;
@@ -140,8 +264,8 @@ export interface Authentication {
     password: string;
     url: string;
     hasNextLink: boolean;
-    headers: Record<string, Partial<Param>>;
-    params: Record<string, Partial<Param>>;
+    headers: Map<string, Partial<Param>>;
+    params: Map<string, Partial<Param>>;
 }
 
 export type MetadataOptions = {
@@ -157,33 +281,70 @@ export type MetadataOptions = {
 
 export interface IProgramMapping {
     program: string;
-    programType: string;
     trackedEntityType: string;
-    customEnrollmentDateColumn: boolean;
-    customIncidentDateColumn: boolean;
-    createEnrollments: boolean;
-    createEntities: boolean;
-    updateEntities: boolean;
-    enrollmentDateColumn: string;
-    incidentDateColumn: string;
     metadataApiAuthentication: Partial<Authentication>;
-    trackedEntityInstanceColumn: string;
-    trackedEntityInstanceColumnIsManual: boolean;
     onlyEnrollOnce: boolean;
     metadataOptions: MetadataOptions;
-    withoutRegistration: boolean;
     responseKey: string;
     remoteProgram: string;
     selectIncidentDatesInFuture: boolean;
     selectEnrollmentDatesInFuture: boolean;
-    longitudeColumn: string;
-    latitudeColumn: string;
+    isTracker: boolean;
+    remoteIsTracker: boolean;
+    createEntities: boolean;
+    createEvents: boolean;
+    updateEntities: boolean;
+    createEnrollments: boolean;
+    updateEnrollments: boolean;
+    createEmptyEvents: boolean;
+    updateEvents: boolean;
+}
+
+export interface OrgUnitMapping {
+    orgUnitColumn: string;
+    customOrgUnitColumn: boolean;
+    otherHierarchyColumns: string;
+    matchHierarchy: boolean;
+    customOtherHierarchyColumns: boolean;
+}
+
+export interface EnrollmentMapping {
+    enrollmentDateColumn: string;
+    incidentDateColumn: string;
+    createEnrollments: boolean;
+    updateEnrollments: boolean;
+    customEnrollmentDateColumn: boolean;
+    customIncidentDateColumn: boolean;
+    enrollmentIdColumn: string;
+    customEnrollmentIdColumn: boolean;
     geometryColumn: string;
-    geometryMerged: boolean;
-    enrollmentLongitudeColumn: string;
-    enrollmentLatitudeColumn: string;
-    enrollmentGeometryColumn: string;
-    enrollmentGeometryMerged: boolean;
+    customGeometryColumn: boolean;
+}
+export interface TrackedEntityMapping {
+    geometryColumn: string;
+    createEntities: boolean;
+    updateEntities: boolean;
+    trackedEntityInstanceColumn: string;
+    customTrackedEntityInstanceColumn: boolean;
+    customGeometryColumn: boolean;
+}
+export interface EventStageMapping {
+    eventDateColumn: string;
+    dueDateColumn: string;
+    eventIdColumn: string;
+    customDueDateColumn: boolean;
+    customEventDateColumn: boolean;
+    customEventIdColumn: boolean;
+    createEmptyEvents: boolean;
+    geometryColumn: string;
+    createEvents: boolean;
+    updateEvents: boolean;
+    uniqueEventDate: boolean;
+    completeEvents: boolean;
+    specificStage: string;
+    stage: string;
+    customGeometryColumn: boolean;
+    uniqueAttribution: boolean;
 }
 
 export interface IAggregateMapping {
@@ -191,26 +352,22 @@ export interface IAggregateMapping {
     remote: string;
     dataElementColumn: string;
     periodColumn: string;
-    attributeOptionComboColumn: string;
     categoryOptionComboColumn: string;
-    categoryColumns: { [key: string]: string };
+    categoryColumns: Map<string, string>;
     valueColumn: string;
-    attributionMerged: boolean;
-    hasAttribution: boolean;
     indicatorGenerationLevel: string;
+    periodType: string;
 }
 
 export interface IMapping {
     id: string;
     name: string;
     description: string;
-    orgUnitColumn: string;
     isSource: boolean;
     created: string;
     useColumnLetters: boolean;
     lastUpdated: string;
     orgUnitSource: "api" | "manual" | "default";
-    customOrgUnitColumn: boolean;
     authentication: Partial<Authentication>;
     orgUnitApiAuthentication: Partial<Authentication>;
     remoteOrgUnitLabelField: string;
@@ -229,7 +386,16 @@ export interface IMapping {
     dataSource: DataSource;
     dhis2SourceOptions: Partial<DHIS2SourceOptions>;
     dhis2DestinationOptions: Partial<DHIS2DestinationOptions>;
+    orgUnitMapping: Partial<OrgUnitMapping>;
+    enrollmentMapping: Partial<EnrollmentMapping>;
+    trackedEntityMapping: Partial<TrackedEntityMapping>;
+    eventStageMapping: Map<string, Partial<EventStageMapping>>;
     chunkSize: number;
+    version: string;
+    attributionMerged: boolean;
+    hasAttribution: boolean;
+    attributeOptionComboColumn: string;
+    categoryColumns: Map<string, string>;
 }
 
 export interface IProgramStage {
@@ -298,7 +464,7 @@ export interface IProgram {
     selectEnrollmentDatesInFuture: boolean;
     selectIncidentDatesInFuture: boolean;
     trackedEntityType: TrackedEntityType;
-    categoryCombo: CommonIdentifier;
+    categoryCombo: CategoryCombo;
     featureType: string;
     displayEnrollmentDateLabel: string;
     displayIncidentDateLabel: string;
@@ -318,33 +484,19 @@ export interface IProgram {
 export interface RealMapping {
     isCustom: boolean;
     mandatory: boolean;
-    value: string;
-    eventDateColumn: string;
-    dueDateColumn: string;
-    eventIdColumn: string;
-    customDueDateColumn: boolean;
-    customEventDateColumn: boolean;
-    customEventIdColumn: boolean;
-    createEmptyEvents: boolean;
+    source: string;
     unique: boolean;
-    createEvents: boolean;
-    updateEvents: boolean;
-    uniqueEventDate: boolean;
     stage: string;
     isSpecific: boolean;
-    valueType: string;
+    valueType: keyof typeof ValueType;
     isOrgUnit: boolean;
-    completeEvents: boolean;
-    longitudeColumn: string;
-    latitudeColumn: string;
-    geometryColumn: string;
-    geometryMerged: boolean;
     customType: string;
+    isManual: boolean;
+    destination: string;
+    format: string;
 }
 
-export interface Mapping {
-    [key: string]: Partial<RealMapping>;
-}
+export type Mapping = Map<string, Partial<RealMapping>>;
 
 export interface Event {
     dueDate: string;
@@ -449,13 +601,20 @@ export interface Option extends OptionBase {
     optionSet?: string;
     mandatory?: boolean;
     availableOptions?: Option[];
-    valueType?: string;
+    valueType?: keyof typeof ValueType;
     entity?: string;
     multiple?: boolean;
     isOrgUnit?: boolean;
     parent?: string;
     options?: Option[];
     allowFutureDate?: boolean;
+    path?: string;
+    isCustom?: boolean;
+    source?: string;
+    stage?: string;
+    customType?: string;
+    isManual?: boolean;
+    isSpecific?: boolean;
 }
 
 export interface MultiOption extends OptionBase {
@@ -810,30 +969,30 @@ export interface GoDataEvent {
     deleted: boolean;
 }
 
-interface DataSetElement {
+export interface DataSetElement {
     dataElement: DataElement;
 }
 
-interface DataElement {
+export interface DataElement {
     code: string;
     name: string;
     id: string;
     categoryCombo: CategoryCombo;
 }
 
-interface CategoryCombo {
+export interface CategoryCombo {
     categories: Category[];
     categoryOptionCombos: Category[];
 }
 
-interface Category {
+export interface Category {
     code: string;
     name: string;
     categoryOptions: CategoryOption[];
     id: string;
 }
 
-interface CategoryOption {
+export interface CategoryOption {
     code: string;
     name: string;
     id: string;
@@ -846,6 +1005,7 @@ export interface IDataSet {
     id: string;
     organisationUnits: DHIS2OrgUnit[];
     categoryCombo: CategoryCombo;
+    periodType: string;
 }
 
 export type AggDataValue = {
@@ -862,6 +1022,10 @@ export interface AggConflict {
     value: string;
     errorCode: string;
     property: string;
+
+    message: string;
+    trackerType: string;
+    uid: string;
 }
 
 export type RelativePeriodType =
@@ -926,8 +1090,10 @@ export type Metadata = {
     destinationOrgUnits: Option[];
     sourceColumns: Option[];
     destinationColumns: Option[];
-    sourceAttributes: Option[];
-    destinationAttributes: Option[];
+    sourceTrackedEntityTypeAttributes: Option[];
+    destinationTrackedEntityTypeAttributes: Option[];
+    sourceTrackedEntityAttributes: Option[];
+    destinationTrackedEntityAttributes: Option[];
     sourceStages: Option[];
     destinationStages: Option[];
     uniqueAttributeValues: Array<Dictionary<any>>;
@@ -943,6 +1109,8 @@ export type Metadata = {
     destinationCategoryOptionCombos: Option[];
     sourceCategoryOptionCombos: Option[];
     sourceCategories: Option[];
+    sourceEnrollmentAttributes: Option[];
+    destinationEnrollmentAttributes: Option[];
 };
 
 export interface GoDataOuTree {
@@ -950,18 +1118,9 @@ export interface GoDataOuTree {
     location: {
         id: string;
         name: string;
+        identifiers?: Array<{ code: string }>;
     };
 }
-
-export type DHIS2ProcessedData = {
-    enrollments: Array<Partial<Enrollment>>;
-    trackedEntityInstances: Array<Partial<TrackedEntityInstance>>;
-    events: Array<Partial<Event>>;
-    eventUpdates: Array<Partial<Event>>;
-    trackedEntityInstanceUpdates: Array<Partial<TrackedEntityInstance>>;
-    conflicts: any[];
-    errors: any[];
-};
 
 export interface DHIS2Response {
     httpStatus: string;
@@ -1048,14 +1207,10 @@ export type PartialEvent = Partial<{
     dataValues: Dictionary<string>;
     geometry: any;
     status: string;
+    dueDate?: string;
+    attributeOptionCombo: string;
+    attributeCategoryOptions: string;
 }>;
-
-export type OtherProcessed = {
-    newInserts: Array<any>;
-    updates: Array<any>;
-    events: Array<any>;
-    labResults: { [key: string]: any };
-};
 
 export type DHIS2SOptions = keyof DHIS2SourceOptions;
 export type DHIS2DOptions = keyof DHIS2DestinationOptions;
@@ -1078,4 +1233,200 @@ export type MappingEvent = {
     value: any;
     path?: KeyOptions;
     subPath?: SubKeys | AuthOptions | ParamsOptions | string;
+};
+
+export type IEnrollment = Partial<
+    Omit<Enrollment, "attributes"> & {
+        attributes: Dictionary<string>;
+    }
+>;
+
+export type CallbackArgs = {
+    trackedEntityInstances: Array<Partial<TrackedEntityInstance>>;
+    events: Array<Partial<Event>>;
+    data: any;
+    currentAttributes: Array<{
+        attribute: string;
+        value: string;
+    }>;
+    pager: Partial<{
+        page: number;
+        pageCount: number;
+        total: number;
+        pageSize: number;
+    }>;
+    goDataData: any;
+};
+
+export type FetchArgs = {
+    mapping: Partial<IMapping>;
+    api: Partial<{ engine: any; axios: AxiosInstance }>;
+    afterFetch: (args: Partial<CallbackArgs>) => void;
+    pageSize: string;
+    fields: string;
+    goData: Partial<IGoData>;
+    uniqueAttributeValues: Array<{ [key: string]: string }>;
+    withAttributes: boolean;
+    numberOfUniqAttribute: number;
+    data: any[];
+    setMessage: (message: string) => void;
+    includeOuTree: boolean;
+};
+
+export type FlattenArgs = {
+    data: Partial<CallbackArgs>;
+    mapping: Partial<IMapping>;
+    tokens: Map<string, string>;
+};
+
+export type ConverterArgs = {
+    mapping: Partial<IMapping>;
+    afterConversion: (args: { convertedData: any[] }) => void;
+    organisationUnitMapping: Mapping;
+    attributeMapping: Mapping;
+    programStageMapping: StageMapping;
+    optionMapping: Record<string, string>;
+    version: number;
+    program: Partial<IProgram>;
+    enrollmentMapping: Mapping;
+    trackedEntityInstances: Array<Partial<TrackedEntityInstance>>;
+    data: any[];
+    goData: any;
+};
+
+export type OU = {
+    id: string;
+    name: string;
+    level: number;
+    ancestors: Array<{ id: string; name: string; level: number }>;
+};
+
+export interface Color {
+    argb: string;
+}
+
+export interface Font {
+    name?: string;
+    size?: number;
+    bold?: boolean;
+    italic?: boolean;
+    underline?: boolean;
+    color?: Color;
+}
+
+export interface Fill {
+    type: "pattern";
+    pattern: "solid" | "darkVertical" | "darkHorizontal" | "darkGrid";
+    fgColor?: Color;
+    bgColor?: Color;
+}
+
+export interface Border {
+    style: "thin" | "medium" | "thick" | "dotted" | "dashed";
+    color?: Color;
+}
+
+export interface Borders {
+    top?: Border;
+    left?: Border;
+    bottom?: Border;
+    right?: Border;
+}
+
+export interface Alignment {
+    vertical?: "top" | "middle" | "bottom";
+    horizontal?: "left" | "center" | "right";
+    wrapText?: boolean;
+}
+
+export interface CellStyle {
+    font?: Font;
+    fill?: Fill;
+    border?: Partial<Borders>;
+    borders?: Borders;
+    alignment?: Alignment;
+    numFmt?: string;
+}
+
+export interface ConditionalFormatting {
+    type: "dataBar" | "colorScale" | "iconSet" | "cellIs" | "containsText";
+    operator?:
+        | "greaterThan"
+        | "lessThan"
+        | "equal"
+        | "between"
+        | "greaterThanOrEqual"
+        | "lessThanOrEqual";
+    value?: number | string;
+    minValue?: number;
+    maxValue?: number;
+    customStyle?: CellStyle;
+    style?: Partial<ExcelStyle>;
+    format?: {
+        minimum?: { color: Color };
+        midpoint?: { color: Color };
+        maximum?: { color: Color };
+        icons?: IconSetTypes;
+        gradient?: boolean;
+        color?: Color;
+    };
+}
+
+export interface ExcelColumnOptions {
+    key: string;
+    width?: number;
+    header?: string | string[];
+    customStyle?: CellStyle;
+    style?: Partial<ExcelStyle>;
+    conditionalFormats?: ConditionalFormatting[];
+    autoWidth?: boolean;
+}
+
+export interface ExcelHeader {
+    title: string;
+    key?: string;
+    width?: number;
+    span?: number;
+    children?: ExcelHeader[];
+    customStyle?: CellStyle;
+    style?: Partial<ExcelStyle>;
+    conditionalFormats?: ConditionalFormatting[];
+    autoWidth?: boolean;
+}
+
+export interface ColumnInfo {
+    totalColumns: number;
+    merges: Array<{
+        start: { row: number; col: number };
+        end: { row: number; col: number };
+    }>;
+    columns: ExcelColumnOptions[];
+    maxDepth: number;
+}
+
+export interface StyleRule {
+    type: "value" | "column" | "row" | "custom";
+    condition: any;
+    columns?: string[];
+    style: CellStyle | ((value: any, rowData: any) => CellStyle);
+}
+
+export interface GenerateExcelOptions {
+    sheetName?: string;
+    styleRules?: StyleRule[];
+    autoFitColumns?: boolean;
+}
+
+export type Parent = {
+    id: string;
+    name: string;
+    parent?: {
+        id: string;
+        name: string;
+        parent?: {
+            id: string;
+            name: string;
+            parent?: { id: string; name: string };
+        };
+    };
 };

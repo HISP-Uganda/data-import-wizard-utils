@@ -1,5 +1,11 @@
 import axios, { AxiosInstance } from "axios";
-import dayjs from "dayjs";
+import dayjs, { Dayjs } from "dayjs";
+import advancedFormat from "dayjs/plugin/advancedFormat";
+import isoWeek from "dayjs/plugin/isoWeek";
+import localeData from "dayjs/plugin/localeData";
+import updateLocale from "dayjs/plugin/updateLocale";
+import weekday from "dayjs/plugin/weekday";
+import weekOfYear from "dayjs/plugin/weekOfYear";
 import { diff } from "jiff";
 import {
     Dictionary,
@@ -8,6 +14,7 @@ import {
     isEmpty,
     isEqual,
     isObject,
+    orderBy,
     transform,
 } from "lodash";
 import {
@@ -20,15 +27,17 @@ import {
     max,
     set,
 } from "lodash/fp";
+import { convertToDHIS2 } from "./dhis2-converter";
+import { processPreviousInstances } from "./entities-processor";
 import {
     AggDataValue,
     Authentication,
-    DHIS2ProcessedData,
     DHIS2Response,
     GODataOption,
-    GODataTokenGenerationResponse,
     GoDataOuTree,
+    GODataTokenGenerationResponse,
     GoResponse,
+    IEnrollment,
     IGoData,
     IGoDataOrgUnit,
     IMapping,
@@ -38,31 +47,57 @@ import {
     Param,
     PartialEvent,
     Period,
+    Processed,
     RealMapping,
     StageMapping,
     TrackedEntityInstance,
     Update,
     ValueType,
+    OU,
 } from "./interfaces";
 import {
-    convertToDHIS2,
-    fetchTrackedEntityInstances,
     findUniqAttributes,
-    flattenTrackedEntityInstances,
-    processPreviousInstances,
+    getProgramStageUniqColumns,
+    getProgramUniqAttributes,
 } from "./program";
+
+import { fetchTrackedEntityInstances } from "./fetch-tracked-entities";
+import { flattenEntitiesByEvents } from "./flatten-dhis2";
 import { generateUid } from "./uid";
+import { emptyProcessedData } from "./constants";
+import { mapUnion } from "./maps";
+
+dayjs.extend(localeData);
+dayjs.extend(updateLocale);
+dayjs.extend(weekday);
+dayjs.extend(advancedFormat);
+dayjs.extend(isoWeek);
+dayjs.extend(weekOfYear);
+
+type NestedMap<K1, K2, V> = Map<K1, Map<K2, V>>;
+
+function updateLocaleAndWeekStart(
+    date: Dayjs,
+    locale: string,
+    weekStart: number,
+): Dayjs {
+    dayjs.locale(locale);
+    dayjs.updateLocale(locale, {
+        weekStart: weekStart,
+    });
+    return dayjs(date);
+}
 
 export function modifyGoDataOu(
     node: GoDataOuTree,
-    parent: { id: string; name: string }
+    parent: { id: string; name: string },
 ) {
     if (!node.children || node.children.length === 0) {
         const { location } = node;
         return { title: location.name, value: location.id };
     }
     const modifiedChildren = node.children.map((chidNode) =>
-        modifyGoDataOu(chidNode, node.location)
+        modifyGoDataOu(chidNode, node.location),
     );
     const { location } = node;
     return {
@@ -74,30 +109,40 @@ export function modifyGoDataOu(
 
 export function getLeavesWithParentInfo(
     node: GoDataOuTree,
-    parentInfo: Array<{ id: string; name: string }> = []
+    parentInfo: Array<{ id: string; name: string; code?: string }> = [],
 ): Array<{
     id: string;
     name: string;
+    code?: string;
     parentInfo: Array<{ id: string; name: string }>;
 }> {
     if (!node.children || node.children.length === 0) {
-        return [{ id: node.location.id, name: node.location.name, parentInfo }];
+        return [
+            {
+                id: node.location.id,
+                name: node.location.name,
+                code: node.location.identifiers?.[0]?.code,
+                parentInfo,
+            },
+        ];
     }
-    const childLeaves = node.children.flatMap((child) =>
+    return node.children.flatMap((child) =>
         getLeavesWithParentInfo(child, [
             ...parentInfo,
-            { name: node.location.name, id: node.location.id },
-        ])
+            {
+                name: node.location.name,
+                id: node.location.id,
+                code: node.location.identifiers?.[0]?.code,
+            },
+        ]),
     );
-
-    return childLeaves;
 }
 
 export const makeFlipped = (dataMapping: Mapping) => {
     return fromPairs(
-        Object.entries(dataMapping).map(([option, { value }]) => {
-            return [value, option];
-        })
+        Object.entries(dataMapping).map(([option, { source }]) => {
+            return [source, option];
+        }),
     );
 };
 
@@ -124,8 +169,8 @@ export const makeRemoteApi = (authentication?: Partial<Authentication>) => {
             params,
             headers: fromPairs(
                 Object.values(authentication?.headers ?? {}).map(
-                    ({ param, value }) => [param, value]
-                )
+                    ({ param, value }) => [param, value],
+                ),
             ),
         });
     }
@@ -136,8 +181,8 @@ export const makeRemoteApi = (authentication?: Partial<Authentication>) => {
             params,
             headers: fromPairs(
                 Object.values(authentication?.headers ?? {}).map(
-                    ({ param, value }) => [param, value]
-                )
+                    ({ param, value }) => [param, value],
+                ),
             ),
         });
     }
@@ -171,7 +216,7 @@ export function getLowestLevelParents(data: IGoDataOrgUnit[]) {
     return grouped[maxGroup].map((child) => {
         const parents = getParent(data, child);
         const name = [...parents.map((x) => x.name).reverse(), child.name].join(
-            "/"
+            "/",
         );
         return { ...child, name };
     });
@@ -180,11 +225,12 @@ export function getLowestLevelParents(data: IGoDataOrgUnit[]) {
 export const fetchRemote = async <IData>(
     authentication: Partial<Authentication> | undefined,
     url: string = "",
-    params: { [key: string]: Param } = {}
+    params: Map<string, Partial<Param>> = new Map(),
+    headers: Map<string, string> = new Map(),
 ) => {
     const api = makeRemoteApi({
         ...authentication,
-        params: { ...(authentication?.params || {}), ...params },
+        params: mapUnion(authentication?.params || new Map(), params),
     });
     const { data } = await api.get<IData>(url);
     return data;
@@ -194,11 +240,11 @@ export const postRemote = async <IData>(
     authentication: Partial<Authentication> | undefined,
     url: string = "",
     payload: Object,
-    params: { [key: string]: Partial<Param> } = {}
+    params: Map<string, Partial<Param>> = new Map(),
 ) => {
     const api = makeRemoteApi({
         ...authentication,
-        params: { ...(authentication?.params || {}), ...params },
+        params: mapUnion(authentication?.params || new Map(), params),
     });
     const { data } = await api.post<IData>(url, payload);
     return data;
@@ -208,11 +254,11 @@ export const putRemote = async <IData>(
     authentication: Partial<Authentication> | undefined,
     url: string = "",
     payload: Object,
-    params: { [key: string]: Partial<Param> } = {}
+    params: Map<string, Partial<Param>> = new Map(),
 ) => {
     const api = makeRemoteApi({
         ...authentication,
-        params: { ...(authentication?.params || {}), ...params },
+        params: mapUnion(authentication?.params || new Map(), params),
     });
     const { data } = await api.put<IData>(url, payload);
     return data;
@@ -221,7 +267,7 @@ export const putRemote = async <IData>(
 export const compareArrays = <TData>(
     source: TData[],
     destination: TData[],
-    key: keyof TData
+    key: keyof TData,
 ) => {
     const sourceKeys = source
         .map((val) => get(key, val))
@@ -245,11 +291,11 @@ export const compareArrays = <TData>(
 export const mergeArrays = <TData>(
     source: TData[],
     destination: TData[],
-    key: string
+    key: string,
 ) => {
     const sources = source.map((val: TData) => [get(key, val), val]);
     let destinations = fromPairs<TData>(
-        destination.map((val) => [get(key, val), val])
+        destination.map((val) => [get(key, val), val]),
     );
 
     sources.forEach(([key, value]) => {
@@ -260,7 +306,7 @@ export const mergeArrays = <TData>(
 
 export const updateObject = (
     state: Mapping,
-    { attribute, value, key }: Update
+    { attribute, value, key }: Update,
 ) => {
     return {
         ...state,
@@ -272,7 +318,7 @@ export const getToken = async <V>(
     authentication: Partial<Authentication> | undefined,
     tokenGenerationUsernameField: string,
     tokenGenerationPasswordField: string,
-    tokenGenerationURL: string
+    tokenGenerationURL: string,
 ) => {
     const {
         params,
@@ -295,28 +341,28 @@ export const getToken = async <V>(
 export const pullRemoteData = async (
     mapping: Partial<IMapping>,
     goData: Partial<IGoData>,
-    tokens: Dictionary<string>,
+    tokens: Map<string, string>,
     token: string,
-    remoteAPI: AxiosInstance
+    remoteAPI: AxiosInstance,
 ) => {
     if (mapping.dataSource === "go-data" && goData.id) {
         const data = await fetchRemote<any[]>(
             {
                 ...mapping.authentication,
-                params: {
-                    auth: { param: "access_token", value: token },
-                },
+                params: new Map([
+                    ["auth", { param: "access_token", value: token }],
+                ]),
             },
-            `api/outbreaks/${goData.id}/cases`
+            `api/outbreaks/${goData.id}/cases`,
         );
         return data.map((d) => {
             const processed = Object.entries(d).map(([key, value]) => {
                 if (isArray(value)) {
-                    return [key, value.map((v) => tokens[v] || v)];
+                    return [key, value.map((v) => tokens.get(v) || v)];
                 }
 
                 if (isString(value)) {
-                    return [key, tokens[value] || value];
+                    return [key, tokens.get(value) || value];
                 }
                 return [key, value];
             });
@@ -335,11 +381,11 @@ export const pullRemoteData = async (
  */
 export function findDiff(
     object: { [key: string]: any },
-    base: { [key: string]: any }
+    base: { [key: string]: any },
 ) {
     function changes(
         object: { [key: string]: any },
-        base: { [key: string]: any }
+        base: { [key: string]: any },
     ) {
         return transform(object, function (result, value, key) {
             if (!isEqual(value, base[key])) {
@@ -356,7 +402,7 @@ export function findDiff(
 export function findDifference(
     destination: { [key: string]: any },
     source: { [key: string]: any },
-    attributes: Dictionary<Option>
+    attributes: Dictionary<Option>,
 ) {
     const sourceKeys = Object.keys(source);
     const destinationKeys = Object.keys(destination);
@@ -369,15 +415,11 @@ export function findDifference(
         const attribute = attributes[key];
         if (attribute) {
         } else {
-            // console.log(key);
         }
 
         if (isArray(destinationValue) && isArray(sourceValue)) {
             const firstDest = destinationValue[0];
             const firstSource = sourceValue[0];
-            // console.log(key, firstDest, firstSource);
-
-            // console.log(findDifference(firstDest, firstSource, attributes));
         } else if (isObject(destinationValue) && isObject(sourceValue)) {
         } else if (
             JSON.stringify(destinationValue) !== JSON.stringify(sourceValue)
@@ -406,7 +448,7 @@ export const getGoDataToken = async (mapping: Partial<IMapping>) => {
         {
             email: username,
             password,
-        }
+        },
     );
 
     if (response) {
@@ -416,12 +458,13 @@ export const getGoDataToken = async (mapping: Partial<IMapping>) => {
 
 export const fetchGoDataHierarchy = async (
     authentication: Partial<Authentication>,
-    locationIds: string[]
+    locationIds: string[],
 ) => {
     const hierarchy = await fetchRemote<GoDataOuTree[]>(
         authentication,
-        "api/locations/hierarchical"
+        "api/locations/hierarchical",
     );
+
     return hierarchy.flatMap((ou) => {
         if (locationIds.indexOf(ou.location.id) !== -1) {
             return getLeavesWithParentInfo(ou);
@@ -433,7 +476,7 @@ export const fetchGoDataHierarchy = async (
 export const loadPreviousGoData = async (
     token: string,
     mapping: Partial<IMapping>,
-    outbreak?: Partial<IGoData>
+    outbreak?: Partial<IGoData>,
 ) => {
     const {
         params,
@@ -449,25 +492,22 @@ export const loadPreviousGoData = async (
         outbreak = await fetchRemote<Partial<IGoData>>(
             {
                 ...rest,
-                params: {
-                    auth: {
-                        param: "access_token",
-                        value: token,
-                    },
-                },
+                params: new Map([
+                    ["auth", { param: "access_token", value: token }],
+                ]),
             },
-            `api/outbreaks/${mapping.program.remoteProgram}`
+            `api/outbreaks/${mapping.program.remoteProgram}`,
         );
     }
 
     const reference = await fetchRemote<any>(
         {
             ...rest,
-            params: {
-                auth: { param: "access_token", value: token },
-            },
+            params: new Map([
+                ["auth", { param: "access_token", value: token }],
+            ]),
         },
-        "api/filter-mappings"
+        "api/filter-mappings",
     );
 
     const tokens = await fetchRemote<{
@@ -477,33 +517,33 @@ export const loadPreviousGoData = async (
     }>(
         {
             ...rest,
-            params: {
-                auth: { param: "access_token", value: token },
-            },
+            params: new Map([
+                ["auth", { param: "access_token", value: token }],
+            ]),
         },
-        "api/languages/english_us/language-tokens"
+        "api/languages/english_us/language-tokens",
     );
-
     const actualTokens = fromPairs(
-        tokens.tokens.map(({ token, translation }) => [token, translation])
+        tokens.tokens.map(({ token, translation }) => [token, translation]),
     );
 
     const organisations = await fetchRemote<IGoDataOrgUnit[]>(
         {
             ...rest,
-            params: {
-                auth: { param: "access_token", value: token },
-            },
+            params: new Map([
+                ["auth", { param: "access_token", value: token }],
+            ]),
         },
-        "api/locations"
+        "api/locations",
     );
-
     const goDataOptions = await fetchRemote<GODataOption[]>(
         {
             ...rest,
-            params: { auth: { param: "access_token", value: token } },
+            params: new Map([
+                ["auth", { param: "access_token", value: token }],
+            ]),
         },
-        "api/reference-data"
+        "api/reference-data",
     );
 
     const realGoDataOptions = goDataOptions.map(({ id }) => {
@@ -513,9 +553,11 @@ export const loadPreviousGoData = async (
     const hierarchy = await fetchGoDataHierarchy(
         {
             ...rest,
-            params: { auth: { param: "access_token", value: token } },
+            params: new Map([
+                ["auth", { param: "access_token", value: token }],
+            ]),
         },
-        outbreak.locationIds
+        outbreak.locationIds,
     );
 
     return {
@@ -558,7 +600,7 @@ export const findChanges = ({
                 const keys = Object.keys(v);
                 const sourceValue = keys.map((k) => v[k]).join("");
                 const destValue = destinationValue.find(
-                    (d: any) => keys.map((k) => d[k]).join("") === sourceValue
+                    (d: any) => keys.map((k) => d[k]).join("") === sourceValue,
                 );
                 if (!destValue) {
                     return v;
@@ -587,37 +629,48 @@ export const evaluateMapping = (
     instanceData: any,
     flippedOptions: Dictionary<string>,
     flippedUnits: Dictionary<string>,
-    uniqAttributes: string[],
-    uniqColumns: string[]
+    uniqAttributes: Array<Partial<RealMapping>>,
 ) => {
     let errors: any[] = [];
     let conflicts: any[] = [];
-    const uniqValues = uniqColumns
-        .map((value) => getOr("", value, instanceData))
+
+    const uniqValues = uniqAttributes
+        .map(({ source }) => getOr("", source, instanceData))
         .join("");
+
+    const availableUniqueAttributes = uniqAttributes
+        .map(({ destination }) => destination)
+        .join("");
+
     let results: { [key: string]: any } = {};
     fields.forEach(
-        ({ value: val, optionSetValue, availableOptions, valueType }) => {
+        ({
+            value: val,
+            optionSetValue,
+            availableOptions,
+            valueType,
+            isOrgUnit,
+        }) => {
             const mapping = attributeMapping[val];
             if (mapping) {
                 const validation = ValueType[mapping.valueType];
-                let value = getOr("", mapping.value, instanceData);
+                let value = getOr("", mapping.source, instanceData);
                 if (mapping.isSpecific) {
-                    value = mapping.value;
+                    value = mapping.source;
                 } else if (value && valueType === "INTEGER") {
                     value = parseInt(value, 10);
                 } else if (valueType === "DATE" && value) {
                     value = value.slice(0, 10);
                 }
                 let result: any = { success: true };
-                if (optionSetValue) {
+                if (optionSetValue && value) {
                     value = flippedOptions[value] || value;
                     if (
                         availableOptions.findIndex(
                             (v: Option) =>
+                                v.value === value ||
                                 v.code === value ||
-                                v.id === value ||
-                                v.value === value
+                                v.id === value,
                         ) !== -1
                     ) {
                         result = { ...result, success: true };
@@ -626,7 +679,7 @@ export const evaluateMapping = (
                             errors = [
                                 ...errors,
                                 {
-                                    id: Date.now() + Math.random(),
+                                    id: generateUid(),
                                     value,
                                     attribute: val,
                                     valueType,
@@ -639,7 +692,7 @@ export const evaluateMapping = (
                             conflicts = [
                                 ...conflicts,
                                 {
-                                    id: Date.now() + Math.random(),
+                                    id: generateUid(),
                                     value,
                                     attribute: val,
                                     valueType: valueType,
@@ -651,7 +704,7 @@ export const evaluateMapping = (
                         }
                         result = { ...result, success: false };
                     }
-                } else if (validation) {
+                } else if (value && validation) {
                     try {
                         result = validation.parse(value);
                         result = { ...result, success: true };
@@ -669,11 +722,11 @@ export const evaluateMapping = (
                                     value,
                                     attribute: val,
                                     valueType: mapping.valueType,
-                                    [uniqAttributes.join("")]: uniqValues,
-                                    id: Date.now() + Math.random(),
+                                    [availableUniqueAttributes]: uniqValues,
+                                    id: generateUid(),
                                 })),
                             ];
-                        } else if (value) {
+                        } else {
                             conflicts = [
                                 ...conflicts,
                                 ...issues.map((i: any) => ({
@@ -681,22 +734,22 @@ export const evaluateMapping = (
                                     value,
                                     attribute: val,
                                     valueType: mapping.valueType,
-                                    [uniqAttributes.join("")]: uniqValues,
-                                    id: Date.now() + Math.random(),
+                                    [availableUniqueAttributes]: uniqValues,
+                                    id: generateUid(),
                                 })),
                             ];
                         }
                     }
                 }
                 if (value && result.success) {
-                    if (mapping.isOrgUnit && flippedUnits[value]) {
+                    if (isOrgUnit && flippedUnits[value]) {
                         results = set(val, flippedUnits[value], results);
                     } else {
                         results = set(val, value, results);
                     }
                 }
             }
-        }
+        },
     );
 
     if (isEmpty(results)) {
@@ -713,7 +766,7 @@ export const evaluateMapping = (
 export const findUpdates = (
     previousData: any[],
     currentData: any,
-    attribute: string
+    attribute: string,
 ) => {
     let result: { update: any[]; insert: any[] } = {
         insert: [],
@@ -728,7 +781,7 @@ export const findUpdates = (
             ({ op, path }) =>
                 ["add", "replace", "copy"].indexOf(op) !== -1 &&
                 path !== `/${attribute}` &&
-                path !== `/addresses/0`
+                path !== `/addresses/0`,
         );
         if (filteredDifferences.length > 0) {
             return {
@@ -755,12 +808,16 @@ export const groupGoData4Insert = async (
     goData: Partial<IGoData>,
     inserts: GoResponse,
     updates: GoResponse,
-    prev: Dictionary<string>,
+    prev: Map<string, string>,
     authentication: Partial<Authentication>,
-    setMessage: React.Dispatch<React.SetStateAction<string>>,
-    setInserted: React.Dispatch<React.SetStateAction<any[]>>,
-    setUpdates: React.Dispatch<React.SetStateAction<any[]>>,
-    setErrors: React.Dispatch<React.SetStateAction<any[]>>
+    setMessage: (message: string) => void,
+    onFinish: (
+        feedback: Partial<{
+            errors: any[];
+            updates: any[];
+            inserts: any[];
+        }>,
+    ) => void,
 ) => {
     const {
         params,
@@ -771,26 +828,25 @@ export const groupGoData4Insert = async (
         username,
         ...rest
     } = authentication;
-    setMessage(() => "Getting auth token");
-    let response: GODataTokenGenerationResponse | undefined = undefined;
-    try {
-        response = await postRemote<GODataTokenGenerationResponse>(
+
+    const response: GODataTokenGenerationResponse | undefined =
+        await postRemote<GODataTokenGenerationResponse>(
             rest,
             "api/users/login",
             {
                 email: username,
                 password,
-            }
+            },
         );
-    } catch (error) {}
+
     if (response) {
         const token = response.id;
         for (const p of inserts.person) {
             const epidemiology = inserts.epidemiology.find(
-                (x) => x.visualId === p.visualId
+                (x) => x.visualId === p.visualId,
             );
             let questionnaireAnswers = inserts.questionnaire.find(
-                (x) => x.visualId === p.visualId
+                (x) => x.visualId === p.visualId,
             );
 
             if (questionnaireAnswers) {
@@ -799,14 +855,16 @@ export const groupGoData4Insert = async (
                     Object.entries(rest).map(([key, value]) => [
                         key,
                         [{ value }],
-                    ])
+                    ]),
                 );
             } else {
                 questionnaireAnswers = {};
             }
 
+            new Map([["auth", { param: "access_token", value: token }]]);
+
             if (epidemiology) {
-                setMessage(() => `Creating person with id ${p.visualId}`);
+                setMessage(`Creating person with id ${p.visualId}`);
                 try {
                     const response = await postRemote<any>(
                         {
@@ -818,22 +876,23 @@ export const groupGoData4Insert = async (
                             ...epidemiology,
                             questionnaireAnswers: questionnaireAnswers,
                         },
-                        {
-                            auth: {
-                                param: "access_token",
-                                value: token,
-                            },
-                        }
+                        new Map([
+                            ["auth", { param: "access_token", value: token }],
+                        ]),
                     );
-                    setInserted((prev) => [...prev, response]);
+                    onFinish({ inserts: response });
                     const { id } = response;
-                    prev = { ...prev, [p.visualId]: id };
+                    prev = prev.set(p.visualId, id);
                 } catch (error) {
                     if (error?.response?.data?.error) {
-                        setErrors((prev) => [
-                            ...prev,
-                            { ...error?.response?.data?.error, id: p.visualId },
-                        ]);
+                        onFinish({
+                            errors: [
+                                {
+                                    ...error?.response?.data?.error,
+                                    id: p.visualId,
+                                },
+                            ],
+                        });
                     }
                 }
             }
@@ -841,17 +900,17 @@ export const groupGoData4Insert = async (
 
         for (const p of updates.person) {
             const epidemiology1 = inserts.epidemiology.find(
-                (x) => x.visualId === p.visualId
+                (x) => x.visualId === p.visualId,
             );
             const epidemiology2 = updates.epidemiology.find(
-                (x) => x.visualId === p.visualId
+                (x) => x.visualId === p.visualId,
             );
 
             const q1 = inserts.questionnaire.find(
-                (x) => x.visualId === p.visualId
+                (x) => x.visualId === p.visualId,
             );
             const q2 = updates.questionnaire.find(
-                (x) => x.visualId === p.visualId
+                (x) => x.visualId === p.visualId,
             );
             let epidemiology = {};
             let questionnaireAnswers = {};
@@ -867,7 +926,7 @@ export const groupGoData4Insert = async (
                     Object.entries(rest).map(([key, value]) => [
                         key,
                         [{ value }],
-                    ])
+                    ]),
                 );
             } else if (q2) {
                 const { visualId: v1, ...rest } = q2;
@@ -875,10 +934,10 @@ export const groupGoData4Insert = async (
                     Object.entries(rest).map(([key, value]) => [
                         key,
                         [{ value }],
-                    ])
+                    ]),
                 );
             }
-            setMessage(() => `Updating person with id ${p.visualId}`);
+            setMessage(`Updating person with id ${p.visualId}`);
             try {
                 const response3 = await putRemote<any>(
                     {
@@ -886,20 +945,27 @@ export const groupGoData4Insert = async (
                     },
                     `api/outbreaks/${goData.id}/cases/${p.id}`,
                     { ...p, ...epidemiology, questionnaireAnswers },
-                    {
-                        auth: {
-                            param: "access_token",
-                            value: token,
-                        },
-                    }
+                    new Map([
+                        [
+                            "auth",
+                            {
+                                param: "access_token",
+                                value: token,
+                            },
+                        ],
+                    ]),
                 );
-                setUpdates((prev) => [...prev, response3]);
+                onFinish({ updates: response3 });
             } catch (error) {
                 if (error?.response?.data?.error) {
-                    setErrors((prev) => [
-                        ...prev,
-                        { ...error?.response?.data?.error, id: p.visualId },
-                    ]);
+                    onFinish({
+                        errors: [
+                            {
+                                ...error?.response?.data?.error,
+                                id: p.visualId,
+                            },
+                        ],
+                    });
                 }
             }
         }
@@ -908,27 +974,28 @@ export const groupGoData4Insert = async (
             const id = prev[l.visualId];
             if (id) {
                 setMessage(
-                    () => `Creating lab result for peron with id ${l.visualId}`
+                    `Creating lab result for peron with id ${l.visualId}`,
                 );
                 try {
                     const response2 = await postRemote(
                         { ...rest },
                         `api/outbreaks/${goData.id}/cases/${id}/lab-results`,
                         l,
-                        {
-                            auth: {
-                                param: "access_token",
-                                value: token,
-                            },
-                        }
+                        new Map([
+                            ["auth", { param: "access_token", value: token }],
+                        ]),
                     );
-                    setInserted((prev) => [...prev, response2]);
+                    onFinish({ inserts: [response2] });
                 } catch (error) {
                     if (error?.response?.data?.error) {
-                        setErrors((prev) => [
-                            ...prev,
-                            { ...error?.response?.data?.error, id: l.visualId },
-                        ]);
+                        onFinish({
+                            errors: [
+                                {
+                                    ...error?.response?.data?.error,
+                                    id: l.visualId,
+                                },
+                            ],
+                        });
                     }
                 }
             }
@@ -936,7 +1003,7 @@ export const groupGoData4Insert = async (
 
         if (inserts.questionnaire.length > 0 && inserts.person.length === 0) {
             for (const q of inserts.questionnaire) {
-                const id = prev[q.visualId];
+                const id = prev.get(q.visualId);
                 const { visualId, ...others } = q;
                 const actual = Object.entries(others).map(([key, value]) => [
                     key,
@@ -944,31 +1011,36 @@ export const groupGoData4Insert = async (
                 ]);
                 if (id) {
                     setMessage(
-                        () =>
-                            `Updating questionnaire  for person with id ${q.visualId}`
+                        `Updating questionnaire  for person with id ${q.visualId}`,
                     );
                     try {
                         const response2 = await putRemote(
                             { ...rest },
                             `api/outbreaks/${goData.id}/cases/${id}`,
                             { questionnaireAnswers: fromPairs(actual) },
-                            {
-                                auth: {
-                                    param: "access_token",
-                                    value: token,
-                                },
-                            }
+                            new Map([
+                                [
+                                    "auth",
+                                    {
+                                        param: "access_token",
+                                        value: token,
+                                    },
+                                ],
+                            ]),
                         );
-                        setUpdates((prev) => [...prev, response2]);
+                        onFinish({
+                            updates: [response2],
+                        });
                     } catch (error) {
                         if (error?.response?.data?.error) {
-                            setErrors((prev) => [
-                                ...prev,
-                                {
-                                    ...error?.response?.data?.error,
-                                    id: q.visualId,
-                                },
-                            ]);
+                            onFinish({
+                                errors: [
+                                    {
+                                        ...error?.response?.data?.error,
+                                        id: q.visualId,
+                                    },
+                                ],
+                            });
                         }
                     }
                 }
@@ -977,7 +1049,7 @@ export const groupGoData4Insert = async (
 
         if (updates.questionnaire.length > 0 && updates.person.length === 0) {
             for (const q of updates.questionnaire) {
-                const id = prev[q.visualId];
+                const id = prev.get(q.visualId);
                 const { visualId, ...others } = q;
                 const actual = Object.entries(others).map(([key, value]) => [
                     key,
@@ -985,31 +1057,36 @@ export const groupGoData4Insert = async (
                 ]);
                 if (id) {
                     setMessage(
-                        () =>
-                            `Updating questionnaire  for person with id ${q.visualId}`
+                        `Updating questionnaire  for person with id ${q.visualId}`,
                     );
                     try {
                         const response2 = await putRemote(
                             { ...rest },
                             `api/outbreaks/${goData.id}/cases/${id}`,
                             { questionnaireAnswers: fromPairs(actual) },
-                            {
-                                auth: {
-                                    param: "access_token",
-                                    value: token,
-                                },
-                            }
+                            new Map([
+                                [
+                                    "auth",
+                                    {
+                                        param: "access_token",
+                                        value: token,
+                                    },
+                                ],
+                            ]),
                         );
-                        setUpdates((prev) => [...prev, response2]);
+                        onFinish({
+                            updates: [response2],
+                        });
                     } catch (error) {
                         if (error?.response?.data?.error) {
-                            setErrors((prev) => [
-                                ...prev,
-                                {
-                                    ...error?.response?.data?.error,
-                                    id: q.visualId,
-                                },
-                            ]);
+                            onFinish({
+                                errors: [
+                                    {
+                                        ...error?.response?.data?.error,
+                                        id: q.visualId,
+                                    },
+                                ],
+                            });
                         }
                     }
                 }
@@ -1017,30 +1094,37 @@ export const groupGoData4Insert = async (
         }
 
         for (const l of updates.lab) {
-            const id = prev[l.visualId];
+            const id = prev.get(l.visualId);
             if (id) {
-                setMessage(
-                    () => `Updating lab result for peron with id ${l.id}`
-                );
+                setMessage(`Updating lab result for peron with id ${l.id}`);
                 try {
                     const response2 = await putRemote(
                         { ...rest },
                         `api/outbreaks/${goData.id}/cases/${id}/lab-results/${l.id}`,
                         l,
-                        {
-                            auth: {
-                                param: "access_token",
-                                value: token,
-                            },
-                        }
+                        new Map([
+                            [
+                                "auth",
+                                {
+                                    param: "access_token",
+                                    value: token,
+                                },
+                            ],
+                        ]),
                     );
-                    setUpdates((prev) => [...prev, response2]);
+                    onFinish({
+                        updates: [response2],
+                    });
                 } catch (error) {
                     if (error?.response?.data?.error) {
-                        setErrors((prev) => [
-                            ...prev,
-                            { ...error?.response?.data?.error, id: l.visualId },
-                        ]);
+                        onFinish({
+                            errors: [
+                                {
+                                    ...error?.response?.data?.error,
+                                    id: l.visualId,
+                                },
+                            ],
+                        });
                     }
                 }
             }
@@ -1051,79 +1135,124 @@ export const groupGoData4Insert = async (
 export const processLineList = ({
     data,
     mapping,
-    attributionMapping,
-    ouMapping,
+    flippedOrgUnits,
+    flippedAttribution,
 }: {
     data: any[];
     mapping: Partial<IMapping>;
-    attributionMapping: Mapping;
-    ouMapping: Mapping;
-}): Array<AggDataValue> => {
+    flippedOrgUnits: Map<string, string>;
+    flippedAttribution: Map<string, string>;
+}): { validData: Array<AggDataValue>; invalidData: any[] } => {
+    const periodType = mapping.aggregate.periodType;
+    const { orgUnitColumn } = mapping.orgUnitMapping;
     const {
-        orgUnitColumn,
+        attributeOptionComboColumn,
+        hasAttribution,
+        attributionMerged,
         aggregate: {
             dataElementColumn,
             periodColumn,
             categoryOptionComboColumn,
-            attributeOptionComboColumn,
             valueColumn,
         },
     } = mapping;
 
-    return data.map((a) => ({
-        dataElement: a[dataElementColumn],
-        period: a[periodColumn],
-        orgUnit: a[orgUnitColumn],
-        categoryOptionCombo: a[categoryOptionComboColumn],
-        attributeOptionCombo: a[attributeOptionComboColumn],
-        value: a[valueColumn],
-    }));
+    let validData: AggDataValue[] = [];
+    let invalidData: any[] = [];
+
+    for (const a of data) {
+        let aggValues: AggDataValue = {
+            dataElement: a[dataElementColumn],
+            period: a[periodColumn],
+            orgUnit: flippedOrgUnits.get(a[orgUnitColumn]),
+            categoryOptionCombo: a[categoryOptionComboColumn],
+            value: a[valueColumn],
+        };
+
+        if (hasAttribution) {
+            if (attributionMerged) {
+                aggValues = {
+                    ...aggValues,
+                    attributeOptionCombo: flippedAttribution.get(
+                        a[attributeOptionComboColumn],
+                    ),
+                };
+            }
+        }
+        const { validData: val, invalidData: inv } = validateAggValue(
+            aggValues,
+            periodType,
+        );
+
+        if (val) {
+            validData = [...validData, ...val];
+        }
+        if (inv) {
+            invalidData = [...invalidData, ...inv];
+        }
+    }
+    return { validData, invalidData };
 };
 
 export const processElements = ({
     mapping,
     dataMapping,
     data,
-    ouMapping,
-    attributionMapping,
+    flippedOrgUnits,
+    flippedAttribution,
 }: {
     data: any[];
     mapping: Partial<IMapping>;
     dataMapping: Mapping;
-    ouMapping: Mapping;
-    attributionMapping: Mapping;
-}): Array<AggDataValue> => {
+    flippedOrgUnits: Map<string, string>;
+    flippedAttribution: Map<string, string>;
+}): { validData: Array<AggDataValue>; invalidData: any[] } => {
+    const { orgUnitColumn } = mapping.orgUnitMapping;
+    const periodType = mapping.aggregate.periodType;
     const {
-        orgUnitColumn,
-        aggregate: {
-            periodColumn,
-            attributeOptionComboColumn,
-            attributionMerged,
-            hasAttribution,
-        },
+        attributeOptionComboColumn,
+        attributionMerged,
+        hasAttribution,
+        aggregate: { periodColumn },
     } = mapping;
-    const processed = data.flatMap((d) => {
-        return Object.entries(dataMapping).map(([key, { value }]) => {
+
+    let validData: AggDataValue[] = [];
+    let invalidData: any[] = [];
+    data.forEach((d) => {
+        return Object.entries(dataMapping).forEach(([key, { source }]) => {
             const [dataElement, categoryOptionCombo] = key.split(",");
             let result: AggDataValue = {
                 dataElement,
                 categoryOptionCombo,
-                value: d[value],
-                orgUnit: d[orgUnitColumn],
+                value: d[source],
+                orgUnit: flippedOrgUnits.get(d[orgUnitColumn]),
                 period: d[periodColumn],
             };
             if (hasAttribution) {
                 if (attributionMerged) {
                     result = {
                         ...result,
-                        attributeOptionCombo: d[attributeOptionComboColumn],
+                        attributeOptionCombo: flippedAttribution.get(
+                            d[attributeOptionComboColumn],
+                        ),
                     };
                 }
             }
-            return result;
+
+            const { validData: val, invalidData: inv } = validateAggValue(
+                result,
+                periodType,
+            );
+
+            if (val) {
+                validData = [...validData, ...val];
+            }
+            if (inv) {
+                invalidData = [...invalidData, ...inv];
+            }
         });
     });
-    return processed;
+    return { validData, invalidData };
 };
 
 export const processOther = () => {};
@@ -1238,7 +1367,7 @@ export const fixedPeriods = [
 
 export const createOptions2 = (
     array: Array<string>,
-    array2: Array<string>
+    array2: Array<string>,
 ): Array<Option> => {
     return array.map((value, index) => {
         return { label: value, value: array2[index] };
@@ -1258,59 +1387,72 @@ export const processDataSet = ({
     data,
     mapping,
     dataMapping,
-    ouMapping,
-    attributionMapping,
+    flippedOrgUnits,
+    flippedAttribution,
 }: {
     data: any[];
     mapping: Partial<IMapping>;
     dataMapping: Mapping;
-    ouMapping: Mapping;
-    attributionMapping: Mapping;
-}) => {
-    const flippedUnits = makeFlipped(ouMapping);
+    flippedOrgUnits: Map<string, string>;
+    flippedAttribution: Map<string, string>;
+}): { validData: Array<AggDataValue>; invalidData: any[] } => {
+    const periodType = mapping.aggregate.periodType;
     const flippedMapping = makeFlipped(dataMapping);
-    const flippedAttribution = makeFlipped(attributionMapping);
-    return data.flatMap((d) => {
+    let validData: AggDataValue[] = [];
+    let invalidData: any[] = [];
+
+    data.forEach((d) => {
         const key = `${d["dataElement"]},${d["categoryOptionCombo"]}`;
         const mapping = flippedMapping[key];
-        const orgUnit = flippedUnits[d["orgUnit"]];
-        const attributeOptionCombo =
-            flippedAttribution[d["attributeOptionCombo"]];
+        const orgUnit = flippedOrgUnits.get(d["orgUnit"]);
+        const attributeOptionCombo = flippedAttribution.get(
+            d["attributeOptionCombo"],
+        );
 
-        if (mapping && orgUnit && attributeOptionCombo) {
+        if (mapping && orgUnit) {
             const [dataElement, categoryOptionCombo] = mapping.split(",");
-            return {
+            const aggValues: AggDataValue = {
                 dataElement,
                 categoryOptionCombo,
                 value: d["value"],
                 orgUnit,
-                attributeOptionCombo,
                 period: d["period"],
+                attributeOptionCombo,
             };
-        }
+            const { validData: val, invalidData: inv } = validateAggValue(
+                aggValues,
+                periodType,
+            );
 
-        return [];
+            if (val) {
+                validData = [...validData, ...val];
+            }
+            if (inv) {
+                invalidData = [...invalidData, ...inv];
+            }
+        }
     });
+    return { validData, invalidData };
 };
 
 export const processIndicators = ({
     mapping,
     dataMapping,
     data,
-    ouMapping,
-    attributionMapping,
+    flippedOrgUnits,
 }: {
     data: any[];
     mapping: Partial<IMapping>;
     dataMapping: Mapping;
-    ouMapping: Mapping;
-    attributionMapping: Mapping;
-}): Array<AggDataValue> => {
-    const flippedUnits = makeFlipped(ouMapping);
-    const processed = data.flatMap((d) => {
-        return Object.entries(dataMapping).flatMap(([key, { value }]) => {
-            const orgUnit = flippedUnits[d["ou"]];
-            if (d["dx"] === value && orgUnit) {
+    flippedOrgUnits: Map<string, string>;
+}): { validData: Array<AggDataValue>; invalidData: any[] } => {
+    const periodType = mapping.aggregate.periodType;
+    let validData: AggDataValue[] = [];
+    let invalidData: any[] = [];
+    data.forEach((d) => {
+        return Object.entries(dataMapping).forEach(([key, { source }]) => {
+            const orgUnit = flippedOrgUnits.get(d["ou"]);
+            if (d["dx"] === source && orgUnit) {
                 const [dataElement, categoryOptionCombo, attributeOptionCombo] =
                     key.split(",");
 
@@ -1324,12 +1466,20 @@ export const processIndicators = ({
                 if (attributeOptionCombo) {
                     result = { ...result, attributeOptionCombo };
                 }
-                return result;
+                const { validData: val, invalidData: inv } = validateAggValue(
+                    result,
+                    periodType,
+                );
+                if (val) {
+                    validData = [...validData, ...val];
+                }
+                if (inv) {
+                    invalidData = [...invalidData, ...inv];
+                }
             }
-            return [];
         });
     });
-    return processed;
+    return { validData, invalidData };
 };
 
 export const validateValue = ({
@@ -1343,7 +1493,7 @@ export const validateValue = ({
     option: Option;
     mapping: Partial<RealMapping>;
     data: any;
-    flippedOptions: Dictionary<string>;
+    flippedOptions: Map<string, string>;
     field: string;
     uniqueKey: string;
 }): Partial<{
@@ -1352,117 +1502,182 @@ export const validateValue = ({
     success: boolean;
     value: any;
 }> => {
-    if (mapping.value) {
-        const validation = ValueType[option.valueType];
-        let value = getOr("", mapping.value, data);
-        if (mapping.isSpecific) {
-            value = mapping.value;
-        }
-        if (mapping.isCustom) {
-            if (mapping.customType === "join columns") {
-                value = mapping.value
-                    .split(",")
-                    .map((col) => getOr("", col, data))
-                    .join(" ");
-            } else if (mapping.customType === "extract year") {
-                value = dayjs(value, "YYYY-MM-DD").format("YYYY");
-            }
-        }
-        if (option.optionSetValue) {
-            value = flippedOptions[value] || value;
-            if (
-                option.availableOptions.findIndex(
-                    (v: Option) =>
-                        v.code === value || v.id === value || v.value === value
-                ) !== -1
-            ) {
-                return { success: true, value };
-            } else {
-                if (mapping.mandatory) {
-                    return {
-                        success: false,
-                        errors: [
-                            {
-                                id: Date.now() + Math.random(),
-                                value,
-                                field,
-                                uniqueKey,
-                                valueType: option.valueType,
-                                message: `Expected values (${option.availableOptions
-                                    .map(({ value }) => value)
-                                    .join(",")})`,
-                            },
-                        ],
-                    };
-                }
-                if (value) {
-                    return {
-                        success: false,
-                        conflicts: [
-                            {
-                                id: Date.now() + Math.random(),
-                                value,
-                                field,
-                                uniqueKey,
-                                valueType: option.valueType,
-                                message: `Expected values (${option.availableOptions
-                                    .map(({ value }) => value)
-                                    .join(",")})`,
-                            },
-                        ],
-                    };
-                }
-            }
-        } else if (validation) {
-            try {
-                validation.parse(value);
-                if (option.valueType === "DATE") {
-                    return {
-                        success: true,
-                        value: String(value).slice(0, 10),
-                    };
-                }
-
-                if (option.valueType === "DATETIME") {
-                    return {
-                        success: true,
-                        value: String(value).replace("Z", ""),
-                    };
-                }
-                return { success: true, value };
-            } catch (error) {
-                const { issues } = error;
-                if (mapping.mandatory) {
-                    return {
-                        success: false,
-                        errors: issues.map((i: any) => ({
-                            ...i,
-                            value,
-                            field,
-                            uniqueKey,
-                            valueType: mapping.valueType,
-                            id: Date.now() + Math.random(),
-                        })),
-                    };
-                }
-                if (value) {
-                    return {
-                        success: false,
-                        conflicts: issues.map((i: any) => ({
-                            ...i,
-                            value,
-                            field,
-                            uniqueKey,
-                            valueType: mapping.valueType,
-                            id: Date.now() + Math.random(),
-                        })),
-                    };
-                }
-            }
-        } else if (value) {
-            return { success: true, value };
+    const validation = ValueType[option.valueType];
+    let value = getOr("", mapping.source, data);
+    if (mapping.isSpecific) {
+        value = mapping.source;
+    }
+    if (mapping.isCustom) {
+        if (mapping.customType === "join columns") {
+            value = mapping.source
+                .split(",")
+                .map((col) => getOr("", col, data))
+                .join(" ");
+        } else if (mapping.customType === "extract year") {
+            value = dayjs(value, "YYYY-MM-DD").format("YYYY");
         }
     }
+    if (option.optionSetValue) {
+        value = flippedOptions.get(value) || value;
+        if (
+            option.availableOptions.findIndex(
+                (v: Option) =>
+                    v.code === value || v.id === value || v.value === value,
+            ) !== -1
+        ) {
+            return { success: true, value, errors: [], conflicts: [] };
+        } else {
+            if (mapping.mandatory) {
+                return {
+                    success: false,
+                    errors: [
+                        {
+                            id: generateUid(),
+                            value,
+                            field,
+                            uniqueKey,
+                            valueType: option.valueType,
+                            attribute: option.value,
+                            message: `Expected values (${option.availableOptions
+                                .map(({ value }) => value)
+                                .join(",")})`,
+                        },
+                    ],
+                    conflicts: [],
+                };
+            }
+            if (value) {
+                return {
+                    success: false,
+                    conflicts: [
+                        {
+                            id: generateUid(),
+                            value,
+                            field,
+                            uniqueKey,
+                            valueType: option.valueType,
+                            attribute: option.value,
+                            message: `Expected values (${option.availableOptions
+                                .map(({ value }) => value)
+                                .join(",")})`,
+                        },
+                    ],
+                    errors: [],
+                };
+            }
+        }
+    }
+    if (validation && value) {
+        try {
+            validation.parse(value);
+            if (option.valueType === "DATE") {
+                return {
+                    success: true,
+                    value: String(value).slice(0, 10),
+                };
+            }
+
+            if (option.valueType === "DATETIME") {
+                return {
+                    success: true,
+                    value: String(value).replace("Z", ""),
+                    errors: [],
+                    conflicts: [],
+                };
+            }
+            if (
+                option.valueType === "BOOLEAN" &&
+                ["true", "1", "yes", "ok"].includes(
+                    String(value).toLowerCase().trim(),
+                )
+            ) {
+                return {
+                    success: true,
+                    value: "true",
+                    errors: [],
+                    conflicts: [],
+                };
+            }
+
+            if (
+                option.valueType === "BOOLEAN" &&
+                ["false", "0", "no"].includes(
+                    String(value).toLowerCase().trim(),
+                )
+            ) {
+                return {
+                    success: true,
+                    value: "false",
+                    errors: [],
+                    conflicts: [],
+                };
+            }
+
+            if (
+                option.valueType === "TRUE_ONLY" &&
+                ["true", "1", "yes", "ok"].includes(
+                    String(value).toLowerCase().trim(),
+                )
+            ) {
+                return {
+                    success: true,
+                    value: "true",
+                    errors: [],
+                    conflicts: [],
+                };
+            }
+            return { success: true, value, errors: [], conflicts: [] };
+        } catch (error) {
+            const { issues } = error;
+            if (mapping.mandatory) {
+                return {
+                    success: false,
+                    errors: issues.map((i: any) => ({
+                        ...i,
+                        value,
+                        field,
+                        uniqueKey,
+                        valueType: mapping.valueType,
+                        id: generateUid(),
+                    })),
+                    conflicts: [],
+                };
+            }
+            if (value) {
+                return {
+                    success: false,
+                    conflicts: issues.map((i: any) => ({
+                        ...i,
+                        value,
+                        field,
+                        uniqueKey,
+                        valueType: mapping.valueType,
+                        id: generateUid(),
+                    })),
+                    errors: [],
+                };
+            }
+        }
+    }
+    if (mapping.mandatory) {
+        return {
+            success: false,
+            errors: [
+                {
+                    id: generateUid(),
+                    value,
+                    field,
+                    uniqueKey,
+                    valueType: option.valueType,
+                    attribute: field,
+                    message:
+                        "Attribute is mandatory but not no value was provided",
+                },
+            ],
+            conflicts: [],
+        };
+    }
+
     return { success: false, conflicts: [], errors: [] };
 };
 
@@ -1472,20 +1687,27 @@ export const processAttributes = ({
     flippedOptions,
     data,
     uniqueKey,
+    createEnrollments,
+    createEntities,
+    updateEnrollments,
+    updateEntities,
 }: {
     attributeMapping: Mapping;
-    attributes: Dictionary<Option>;
-    flippedOptions: Dictionary<string>;
+    attributes: Option[];
+    flippedOptions: Map<string, string>;
     data: any;
     uniqueKey: string;
+    updateEnrollments: boolean;
+    createEnrollments: boolean;
+    createEntities: boolean;
+    updateEntities: boolean;
 }) => {
     let source: { [key: string]: any } = {};
     let conflicts: any[] = [];
     let errors: any[] = [];
-
-    Object.entries(attributeMapping).forEach(([attribute, aMapping]) => {
-        const currentAttribute = attributes[attribute];
-        if (aMapping.value && currentAttribute) {
+    attributes.forEach((currentAttribute) => {
+        const aMapping = attributeMapping.get(currentAttribute.value);
+        if (aMapping && aMapping.source) {
             const {
                 success,
                 conflicts: cs,
@@ -1494,18 +1716,38 @@ export const processAttributes = ({
             } = validateValue({
                 data,
                 option: currentAttribute,
-                field: attribute,
+                field: currentAttribute.value,
                 mapping: aMapping,
                 flippedOptions,
                 uniqueKey,
             });
-
             if (success) {
-                source = { ...source, [attribute]: value };
+                source = {
+                    ...source,
+                    [currentAttribute.value]: value,
+                };
             } else {
                 conflicts = conflicts.concat(cs);
                 errors = errors.concat(es);
             }
+        } else if (
+            currentAttribute.mandatory &&
+            (createEnrollments ||
+                createEntities ||
+                updateEnrollments ||
+                updateEntities)
+        ) {
+            errors = errors.concat([
+                {
+                    id: generateUid(),
+                    value: "",
+                    field: currentAttribute.value,
+                    uniqueKey,
+                    valueType: currentAttribute.valueType,
+                    attribute: currentAttribute.value,
+                    message: "Attribute is mandatory but not mapped",
+                },
+            ]);
         }
     });
 
@@ -1515,43 +1757,20 @@ export const processAttributes = ({
 export const getGeometry = ({
     data,
     featureType,
-    geometryMerged,
     geometryColumn,
-    latitudeColumn,
-    longitudeColumn,
 }: {
     featureType: string;
-    geometryMerged: boolean;
     geometryColumn: string;
-    latitudeColumn: string;
-    longitudeColumn: string;
     data: any;
 }) => {
-    if (featureType === "POINT" && geometryMerged && geometryColumn) {
+    if (geometryColumn && featureType === "POINT") {
         const point = getOr("", geometryColumn, data);
-
         if (point && isArray(point)) {
             return {
                 type: "Point",
                 coordinates: point,
             };
         }
-    } else if (
-        featureType === "POINT" &&
-        !geometryMerged &&
-        latitudeColumn &&
-        longitudeColumn
-    ) {
-        const lat = getOr("", latitudeColumn, data);
-        const lon = getOr("", longitudeColumn, data);
-
-        if (lon && lat) {
-            return {
-                type: "Point",
-                coordinates: [lat, lon],
-            };
-        }
-    } else if (featureType === "POLYGON" && geometryColumn) {
     }
     return {};
 };
@@ -1561,9 +1780,6 @@ export const makeEvent = ({
     data,
     featureType,
     geometryColumn,
-    geometryMerged,
-    latitudeColumn,
-    longitudeColumn,
     eventIdColumn,
     elements,
     programStage,
@@ -1574,49 +1790,59 @@ export const makeEvent = ({
     options,
     dataElements,
     uniqueKey,
+    registration,
+    dueDateColumn,
+    attributionValue,
+    hasAttribution,
 }: {
     eventDateColumn: string;
     data: any;
     featureType: string;
     geometryColumn: string;
-    geometryMerged: boolean;
-    latitudeColumn: string;
-    longitudeColumn: string;
     eventIdColumn: string;
-    elements: {
-        [key: string]: Partial<RealMapping>;
-    };
+    elements: Map<string, Partial<RealMapping>>;
     programStage: string;
-    enrollment: { enrollmentDate: string; enrollment: string };
-    trackedEntityInstance: string;
+    enrollment?: IEnrollment;
+    trackedEntityInstance?: string;
     program: string;
     orgUnit: string;
-    options: Dictionary<string>;
+    options: Map<string, string>;
     dataElements: Dictionary<Option>;
     uniqueKey: string;
+    registration: boolean;
+    hasAttribution: boolean;
+    attributionValue: string;
+    dueDateColumn?: string;
 }): Partial<{
     errors: any[];
     conflicts: any[];
     event: PartialEvent;
 }> => {
     const possibleEventDate = dayjs(getOr("", eventDateColumn, data));
+    const possibleDueDate = dayjs(getOr("", dueDateColumn, data));
     let dataValues = {};
     let conflicts: any[] = [];
     let errors: any[] = [];
+    let dueDate = "";
+    if (possibleDueDate.isValid()) {
+        dueDate = possibleDueDate.format("YYYY-MM-DD");
+    }
     if (possibleEventDate.isValid()) {
         const eventDate = possibleEventDate.format("YYYY-MM-DD");
         let eventGeometry = getGeometry({
             data,
             featureType,
             geometryColumn,
-            geometryMerged,
-            latitudeColumn,
-            longitudeColumn,
         });
         const eventId = getOr(generateUid(), eventIdColumn, data);
-        Object.entries(elements).forEach(([dataElement, eMapping]) => {
+        elements.forEach((eMapping, dataElement) => {
+            console.log("Are we here finally");
             const currentDataElement = dataElements[dataElement];
-            const validation = validateValue({
+            const {
+                value,
+                errors: errs,
+                conflicts: conf,
+            } = validateValue({
                 data,
                 option: currentDataElement,
                 field: dataElement,
@@ -1624,35 +1850,114 @@ export const makeEvent = ({
                 flippedOptions: options,
                 uniqueKey,
             });
-            if (validation.value) {
+            if (value) {
                 dataValues = {
                     ...dataValues,
-                    [dataElement]: validation.value,
+                    [dataElement]: value,
                 };
             } else {
-                conflicts = conflicts.concat(validation.conflicts);
-                errors = errors.concat(validation.errors);
+                conflicts = conflicts.concat(
+                    conf.map((a) => ({
+                        ...a,
+                        trackedEntityInstance,
+                        id: `${a.id}${trackedEntityInstance}${uniqueKey}`,
+                    })),
+                );
+                errors = errors.concat(
+                    errs.map((a) => ({
+                        ...a,
+                        trackedEntityInstance,
+                        id: `${a.id}${trackedEntityInstance}${uniqueKey}`,
+                    })),
+                );
             }
         });
         let event: PartialEvent = {
             eventDate,
             programStage,
-            enrollment: enrollment.enrollment,
-            trackedEntityInstance,
             program,
             orgUnit,
             event: eventId,
             dataValues,
         };
+
+        if (dueDate) {
+            event = { ...event, dueDate };
+        }
+
         if (!isEmpty(eventGeometry)) {
             event = { ...event, geometry: eventGeometry };
         }
-        return { event, errors, conflicts };
+
+        if (hasAttribution) {
+            if (attributionValue && !registration && orgUnit) {
+                return {
+                    event: { ...event, attributeOptionCombo: attributionValue },
+                    errors,
+                    conflicts,
+                };
+            } else if (
+                attributionValue &&
+                registration &&
+                enrollment &&
+                trackedEntityInstance
+            ) {
+                return {
+                    event: {
+                        ...event,
+                        enrollment: enrollment.enrollment,
+                        trackedEntityInstance,
+                        attributeOptionCombo: attributionValue,
+                    },
+                    errors,
+                    conflicts,
+                };
+            } else {
+                return {
+                    errors: [
+                        {
+                            id: generateUid(),
+                            field: "attribution",
+                            valueType: "attribution",
+                            message: `Attribution value is missing`,
+                            uniqueKey,
+                        },
+                    ],
+                    conflicts,
+                };
+            }
+        } else if (!registration && orgUnit) {
+            return { event, errors, conflicts };
+        } else if (registration && enrollment && trackedEntityInstance) {
+            return {
+                event: {
+                    ...event,
+                    enrollment: enrollment.enrollment,
+                    trackedEntityInstance,
+                },
+                errors,
+                conflicts,
+            };
+        }
+
+        return {
+            errors: [
+                {
+                    id: generateUid(),
+                    value: possibleEventDate,
+                    field: "enrollment/tracked entity instance",
+                    valueType: "enrollment",
+                    message: `enrollment/tracked entity instance is missing`,
+                    uniqueKey,
+                },
+            ],
+            conflicts,
+        };
     }
     return {
         errors: [
             {
-                id: Date.now() + Math.random(),
+                id: generateUid(),
                 value: possibleEventDate,
                 field: "eventDate",
                 valueType: "DATE",
@@ -1680,7 +1985,7 @@ export const getConflicts = (error: DHIS2Response) => {
                 return reference;
             }
             return [];
-        }
+        },
     );
     return {
         conflicts,
@@ -1704,77 +2009,356 @@ export const processInstances = async (
         optionMapping,
         organisationUnitMapping,
         programStageMapping,
-        programStageUniqueElements,
-        programUniqAttributes,
+        enrollmentMapping,
+        attributionMapping,
         setMessage,
     }: {
         attributeMapping: Mapping;
+        attributionMapping: Mapping;
         mapping: Partial<IMapping>;
         trackedEntityInstances: Array<Partial<TrackedEntityInstance>>;
         api: Partial<{ engine: any; axios: AxiosInstance }>;
         version: number;
         program: Partial<IProgram>;
-        optionMapping: Record<string, string>;
+        optionMapping: Map<string, string>;
         organisationUnitMapping: Mapping;
         programStageMapping: StageMapping;
-        programStageUniqueElements: Dictionary<string[]>;
-        programUniqAttributes: string[];
+        enrollmentMapping: Mapping;
         setMessage: (message: string) => void;
     },
-    callback: (processedData: DHIS2ProcessedData) => Promise<void>
+    callback: (processedData: Processed) => void,
 ) => {
-    const currentData = flattenTrackedEntityInstances(
-        {
-            trackedEntityInstances,
-        },
-        "ALL"
+    let stages: string[] = [];
+    const programUniqAttributes = getProgramUniqAttributes(attributeMapping);
+    const programStageUniqueElements = getProgramStageUniqColumns(
+        mapping.eventStageMapping,
+        programStageMapping,
     );
-    let uniqueAttributeValues: any[] = [];
-    let trackedInstanceIds: string[] = [];
-    if (mapping.program?.trackedEntityInstanceColumn) {
-        trackedInstanceIds = trackedEntityInstances
-            .map(({ trackedEntityInstance }) => trackedEntityInstance ?? "")
-            .filter((a) => a !== "");
-    } else {
-        uniqueAttributeValues = findUniqAttributes(
-            currentData,
-            attributeMapping
-        );
+
+    if (
+        mapping.program?.program === mapping.program?.remoteProgram &&
+        mapping.dataSource === "dhis2-program" &&
+        mapping.isCurrentInstance
+    ) {
+        stages = Object.keys(programStageMapping);
     }
 
-    if (currentData.length > 0) {
-        setMessage(`Fetching data from destination program`);
-        const instances = await fetchTrackedEntityInstances({
-            api,
-            program: mapping.program?.program,
-            additionalParams: {},
-            uniqueAttributeValues,
-            withAttributes: true,
-            trackedEntityInstances: trackedInstanceIds,
-            fields: "*",
-            pageSize: "50",
-        });
+    const currentData = flattenEntitiesByEvents(trackedEntityInstances);
+    let instances: Array<Partial<TrackedEntityInstance>> = [];
 
-        const previous = processPreviousInstances({
-            trackedEntityInstances: instances.trackedEntityInstances,
-            programUniqAttributes,
-            programStageUniqueElements,
-            currentProgram: mapping.program?.program,
-            trackedEntityIdIdentifiesInstance: trackedInstanceIds.length > 0,
-            programStageMapping,
-        });
+    let uniqueAttributeValues: any[] = [];
+    let trackedInstanceIds: string[] = [];
 
-        const convertedData = await convertToDHIS2({
-            previousData: previous,
-            data: currentData,
-            mapping: mapping,
-            organisationUnitMapping,
-            attributeMapping,
-            programStageMapping,
-            optionMapping,
-            version,
-            program,
+    if (
+        mapping.program?.program === mapping.program?.remoteProgram &&
+        mapping.dataSource === "dhis2-program" &&
+        mapping.isCurrentInstance
+    ) {
+        instances = trackedEntityInstances;
+        trackedInstanceIds = trackedEntityInstances.flatMap(
+            ({ trackedEntityInstance }) => {
+                if (trackedEntityInstance) return trackedEntityInstance;
+                return [];
+            },
+        );
+    } else {
+        const { trackedEntityInstanceColumn } =
+            mapping.trackedEntityMapping ?? { trackedEntityInstanceColumn: "" };
+        if (trackedEntityInstanceColumn) {
+            trackedInstanceIds = trackedEntityInstances.flatMap(
+                ({ trackedEntityInstance }) => {
+                    if (trackedEntityInstance) return trackedEntityInstance;
+                    return [];
+                },
+            );
+        } else {
+            uniqueAttributeValues = findUniqAttributes(
+                currentData,
+                attributeMapping,
+            );
+        }
+        if (currentData.length > 0) {
+            setMessage("Fetching previous data for tracked entity instances");
+            const { trackedEntityInstances } =
+                await fetchTrackedEntityInstances({
+                    api,
+                    program: mapping.program?.program,
+                    additionalParams: {},
+                    uniqueAttributeValues,
+                    withAttributes: true,
+                    trackedEntityInstances: trackedInstanceIds,
+                    fields: "*",
+                    pageSize: "50",
+                    setMessage,
+                });
+            instances = trackedEntityInstances;
+        }
+    }
+
+    const previous = processPreviousInstances({
+        trackedEntityInstances: instances,
+        programUniqAttributes,
+        programStageUniqueElements,
+        currentProgram: mapping.program?.program,
+        programStageMapping,
+        trackedEntityIdIdentifiesInstance: trackedInstanceIds.length > 0,
+        eventStageMapping: mapping.eventStageMapping,
+    });
+    setMessage(`Converting data to destination DHIS2`);
+    const convertedData = convertToDHIS2({
+        previousData: previous,
+        data: currentData,
+        mapping: mapping,
+        organisationUnitMapping,
+        attributeMapping,
+        programStageMapping,
+        optionMapping,
+        version,
+        program,
+        enrollmentMapping,
+        attributionMapping,
+    });
+    callback({ ...emptyProcessedData, dhis2: convertedData });
+};
+
+export const validatePeriod = (period: string, periodType: string): boolean => {
+    const periodTypes = {
+        Daily: /^(\d{4})(\d{2})(\d{2})$/,
+        Weekly: /^(\d{4})W(\d{1})$/,
+        WeeklyWednesday: /^(\d{4})WedW(\d{1})$/,
+        WeeklyThursday: /^(\d{4})ThuW(\d{1})$/,
+        WeeklySaturday: /^(\d{4})SatW(\d{1})$/,
+        WeeklySunday: /^(\d{4})SunW(\d{1})$/,
+        BiWeekly: /^(\d{4})BiW(\d{2})$/,
+        Monthly: /^(\d{4})(\d{2})$/,
+        BiMonthly: /^(\d{4})(\d{2})B$/,
+        Quarterly: /^(\d{4})Q(\d{1})$/,
+        // QUARTERLYNOVEMBER: /^(\d{4})NovemberQ(\d{1})$/,
+        SixMonthly: /^(\d{4})S(\d{1})$/,
+        SixMonthlyApril: /^(\d{4})AprilS(\d{1})$/,
+        // SIXMONTHLYNOV: /^(\d{4})NovemberS(\d{1})$/,
+        Yearly: /^(\d{4})$/,
+        FinancialNov: /^(\d{4})Nov$/,
+        FinancialOct: /^(\d{4})Oct$/,
+        FinancialJuly: /^(\d{4})Jul$/,
+        FinancialApril: /^(\d{4})Apr$/,
+    };
+    return periodTypes[periodType]?.test(period);
+};
+
+export const validateAggValue = (
+    aggValue: AggDataValue,
+    periodType: string,
+) => {
+    let validData: AggDataValue[] = [];
+    let invalidData: any[] = [];
+    const {
+        dataElement,
+        period,
+        orgUnit,
+        value,
+        categoryOptionCombo,
+        attributeOptionCombo,
+    } = aggValue;
+    if (
+        dataElement &&
+        period &&
+        orgUnit &&
+        value &&
+        validatePeriod(period, periodType)
+    ) {
+        validData = validData.concat({
+            dataElement,
+            period,
+            orgUnit,
+            categoryOptionCombo,
+            value,
+            attributeOptionCombo,
         });
-        callback(convertedData);
+    } else {
+        if (!dataElement) {
+            invalidData = [
+                ...invalidData,
+                { ...aggValue, error: "Data element is missing" },
+            ];
+        }
+        if (!period) {
+            invalidData = [
+                ...invalidData,
+                { ...aggValue, error: "Period is missing" },
+            ];
+        }
+        if (!validatePeriod(period, periodType)) {
+            invalidData = [
+                ...invalidData,
+                { ...aggValue, error: "Period is invalid" },
+            ];
+        }
+        if (!orgUnit) {
+            invalidData = [
+                ...invalidData,
+                { ...aggValue, error: "Organisation unit is missing" },
+            ];
+        }
+        if (!value) {
+            invalidData = [
+                ...invalidData,
+                { ...aggValue, error: "Value is missing" },
+            ];
+        }
+    }
+    return { validData, invalidData };
+};
+
+export function buildParameters(mapping: Partial<IMapping>) {
+    let additionalParams: Record<string, string> = {};
+
+    if (
+        mapping.dhis2SourceOptions?.ous &&
+        mapping.dhis2SourceOptions.ous.length > 0
+    ) {
+        additionalParams = {
+            ...additionalParams,
+            orgUnit: mapping.dhis2SourceOptions.ous[0],
+        };
+    }
+    if (
+        mapping.program.isTracker &&
+        mapping.dhis2SourceOptions?.trackedEntityInstance
+    ) {
+        additionalParams = {
+            ...additionalParams,
+            trackedEntityInstance:
+                mapping.dhis2SourceOptions.trackedEntityInstance,
+        };
+    }
+
+    if (
+        mapping.dhis2SourceOptions &&
+        mapping.dhis2SourceOptions.period &&
+        mapping.dhis2SourceOptions.period.length > 0 &&
+        mapping.dhis2SourceOptions.period[0].startDate &&
+        mapping.dhis2SourceOptions.period[0].endDate &&
+        mapping.dhis2SourceOptions.searchPeriod === "enrollmentDate"
+    ) {
+        const programStartDate = mapping.dhis2SourceOptions.period[0].startDate;
+        const programEndDate = mapping.dhis2SourceOptions.period[0].endDate;
+
+        additionalParams = {
+            ...additionalParams,
+            programEndDate,
+            programStartDate,
+        };
+    }
+
+    return additionalParams;
+}
+
+export const isExcel = (mapping: Partial<IMapping>) => {
+    return (
+        [
+            "csv-line-list",
+            "xlsx-line-list",
+            "xlsx-tabular-data",
+            "xlsx-form",
+        ].indexOf(mapping.dataSource) !== -1
+    );
+};
+
+export const isDHIS2 = (mapping: Partial<IMapping>) => {
+    return (
+        [
+            "dhis2-data-set",
+            "dhis2-indicators",
+            "dhis2-program-indicators",
+            "dhis2-program",
+            "manual-dhis2-program-indicators",
+        ].indexOf(mapping.dataSource) !== -1
+    );
+};
+
+export function cleanString(
+    input: string,
+    preserveSpaces: boolean = false,
+): string {
+    if (preserveSpaces) {
+        return input.replace(/[^a-zA-Z0-9 ]/g, "");
+    } else {
+        return input.replace(/[^a-zA-Z0-9]/g, "");
+    }
+}
+
+export const flipMapping = (mapping: Mapping, isOrgUnit: boolean = false) => {
+    const flipped: Map<string, string> = new Map<string, string>();
+    mapping.forEach((value, unit) => {
+        if (isOrgUnit && value && value.source) {
+            value.source.split(",").forEach((u) => {
+                flipped.set(cleanString(u).toLowerCase(), unit);
+            });
+        } else if (value && value.source) {
+            value.source.split(",").forEach((u) => {
+                flipped.set(u, unit);
+            });
+        }
+    });
+    return flipped;
+};
+
+export const sortOptionsByMandatory = (options: Option[]) =>
+    orderBy(options, ["mandatory", "unique", "label"], ["desc", "desc", "asc"]);
+
+export const queryOrganisationUnits = async (
+    api: Partial<{ engine: any; axios: AxiosInstance }>,
+    units: string[],
+) => {
+    if (api.engine) {
+        const {
+            units: { organisationUnits },
+        }: { units: { organisationUnits: OU[] } } = await api.engine.query({
+            units: {
+                resource: `organisationUnits`,
+                params: {
+                    filter: `id:in:[${units.join(",")}]`,
+                    paging: "false",
+                    fields: "id,name,level,ancestors[id,name,level]",
+                },
+            },
+        });
+        return organisationUnits.reduce((agg, ou) => {
+            agg[ou.id] = {
+                [`level${ou.level}id`]: ou.id,
+                [`level${ou.level}name`]: ou.name,
+                ...ou.ancestors.reduce((agg, ancestor) => {
+                    agg[`level${ancestor.level}id`] = ancestor.id;
+                    agg[`level${ancestor.level}name`] = ancestor.name;
+                    return agg;
+                }, {}),
+            };
+            return agg;
+        }, {});
+    } else if (api.axios) {
+        const {
+            data: { organisationUnits },
+        } = await api.axios.get<{
+            organisationUnits: OU[];
+        }>(`api/organisationUnits.json`, {
+            params: {
+                filter: `id:in:[${units.join(",")}]`,
+                paging: "false",
+                fields: "id,name,level,ancestors[id,name,level]",
+            },
+        });
+        return organisationUnits.reduce((agg, ou) => {
+            agg[ou.id] = {
+                [`${ou.level}id`]: ou.id,
+                [`${ou.level}name`]: ou.name,
+                ...ou.ancestors.reduce((agg, ancestor) => {
+                    agg[`${ancestor.level}id`] = ancestor.id;
+                    agg[`${ancestor.level}name`] = ancestor.name;
+                    return agg;
+                }, {}),
+            };
+            return agg;
+        }, {});
     }
 };
